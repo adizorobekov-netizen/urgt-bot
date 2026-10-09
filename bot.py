@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import io
+import os
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, Router
