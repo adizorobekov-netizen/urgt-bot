@@ -1,4 +1,5 @@
 aiogram==3.17.0
+pydantic==2.10.6
 apscheduler==3.10.4
 beautifulsoup4==4.12.3
 aiohttp==3.10.5
