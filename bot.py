@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import io
-import aiohttp import web
+import aiohttp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
