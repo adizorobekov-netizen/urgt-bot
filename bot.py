@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import io
-import aiohttp
+import aiohttp import web
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -192,20 +192,42 @@ async def check_schedule(bot: Bot):
         logging.error(f"Ошибка при проверке сайта: {e}")
 
 
+# --- ДОБАВЛЯЕМ ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render передает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Веб-сервер запущен на порту {port}")
+# -----------------------------------------
+
 async def main():
+    # Инициализация бота и диспетчера
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
     await init_db()
 
+    # Настройка планировщика
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_schedule, 'interval', minutes=30, args=(bot,))
     scheduler.start()
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
 
+    # ЗАПУСКАЕМ ВЕБ-СЕРВЕР И БОТА ОДНОВРЕМЕННО
+    await asyncio.gather(
+        start_web_server(),
+        dp.start_polling(bot)
+    )
 
 if __name__ == "__main__":
     asyncio.run(main())
