@@ -1,11 +1,10 @@
 import asyncio
 import logging
 import os
-import re
 import io
 import aiohttp
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -16,8 +15,7 @@ from bs4 import BeautifulSoup
 import aiosqlite
 import pdfplumber
 
-# ДАННЫЕ БОТА (ЗАМЕНИТЕ ТОКЕН ПРИ НЕОБХОДИМОСТИ)
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"
+TOKEN = "8898464745:AAGsD4g7lKw2t03hZPXWeB1yjjir2DtkJnc"
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -29,7 +27,6 @@ class RegisterState(StatesGroup):
 class GetScheduleState(StatesGroup):
     waiting_for_date = State()
 
-# Инициализация БД
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -45,7 +42,6 @@ async def init_db():
         """)
         await db.commit()
 
-# Команда /start
 async def cmd_start(message: Message, state: FSMContext):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT group_name FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
@@ -65,12 +61,10 @@ async def cmd_start(message: Message, state: FSMContext):
                 )
                 await state.set_state(RegisterState.waiting_for_group)
 
-# Команда /change
 async def cmd_change(message: Message, state: FSMContext):
     await message.answer("Введи новое название своей группы:")
     await state.set_state(RegisterState.waiting_for_group)
 
-# Сохранение группы
 async def process_group(message: Message, state: FSMContext):
     group_name = message.text.strip().upper()
     async with aiosqlite.connect(DB_NAME) as db:
@@ -86,21 +80,17 @@ async def process_group(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# Улучшенный поиск расписания группы в PDF с учетом дефисов и тире
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
         clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
-        
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text:
                     continue
-                
                 lines = text.split('\n')
                 for i, line in enumerate(lines):
                     clean_line = line.replace("-", "").replace("–", "").replace(" ", "").upper()
-                    
                     if clean_target in clean_line:
                         group_text_lines = lines[i:i+20]
                         return "\n".join(group_text_lines)
@@ -108,7 +98,6 @@ def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
         logging.error(f"Ошибка чтения PDF: {e}")
     return ""
 
-# Получение всех PDF ссылок с сайта
 async def fetch_pdf_links():
     links = []
     try:
@@ -133,12 +122,22 @@ async def fetch_pdf_links():
         logging.error(f"Ошибка получения ссылок: {e}")
     return links
 
-# Команда /get — Запрос расписания по дате
+async def download_pdf_content(session, url):
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                return None
+            content = await resp.read()
+            if content.startswith(b'%PDF'):
+                return content
+    except Exception as e:
+        logging.error(f"Ошибка загрузки PDF {url}: {e}")
+    return None
+
 async def cmd_get_schedule(message: Message, state: FSMContext):
-    await message.answer("Напиши число или дату, за которую нужно расписание (например: `10` или `10.10`):", parse_mode="Markdown")
+    await message.answer("Напиши число или дату, за которую нужно расписание (например: `10` или `12.10`):", parse_mode="Markdown")
     await state.set_state(GetScheduleState.waiting_for_date)
 
-# Обработка введенной даты
 async def process_date_request(message: Message, state: FSMContext):
     search_date = message.text.strip()
     await state.clear()
@@ -152,11 +151,11 @@ async def process_date_request(message: Message, state: FSMContext):
         return
 
     group_name = user_row[0]
-    status_msg = await message.answer(f"🔍 Ищу расписание на `{search_date}` число для группы **{group_name}**...", parse_mode="Markdown")
+    status_msg = await message.answer(f"🔍 Ищу расписание на `{search_date}` для группы **{group_name}**...", parse_mode="Markdown")
 
     links = await fetch_pdf_links()
     if not links:
-        await status_msg.edit_text("❌ Не удалось загрузить файлы с сайта техникума.")
+        await status_msg.edit_text("❌ Не удалось загрузить ссылки с сайта техникума.")
         return
 
     matched_links = []
@@ -170,70 +169,61 @@ async def process_date_request(message: Message, state: FSMContext):
 
     pdf_link, link_title = matched_links[0]
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(pdf_link) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text("❌ Не удалось скачать PDF-файл.")
-                    return
-                pdf_bytes = await resp.read()
+    async with aiohttp.ClientSession() as session:
+        pdf_bytes = await download_pdf_content(session, pdf_link)
 
-        schedule_text = extract_group_schedule(pdf_bytes, group_name)
+    if not pdf_bytes:
+        await status_msg.edit_text("❌ Не удалось скачать PDF-файл (ссылка ведет не на документ).")
+        return
 
-        if schedule_text:
-            await status_msg.edit_text(
-                f"📅 **Расписание ({link_title}):**\n\n```{schedule_text}```",
-                parse_mode="Markdown"
-            )
-        else:
-            await status_msg.edit_text(
-                f"📄 Файл **{link_title}** найден, но строчек для группы `{group_name}` в нем не обнаружено.",
-                parse_mode="Markdown"
-            )
-    except Exception as e:
-        logging.error(f"Ошибка обработки: {e}")
-        await status_msg.edit_text("❌ Произошла ошибка при обработке расписания.")
+    schedule_text = extract_group_schedule(pdf_bytes, group_name)
 
-# Автоматическая рассылка по планировщику
+    if schedule_text:
+        await status_msg.edit_text(
+            f"📅 **Расписание ({link_title}):**\n\n```{schedule_text}```",
+            parse_mode="Markdown"
+        )
+    else:
+        await status_msg.edit_text(
+            f"📄 Файл **{link_title}** найден, но строчек для группы `{group_name}` в нем не обнаружено.",
+            parse_mode="Markdown"
+        )
+
 async def check_schedule(bot: Bot):
-    logging.info("Проверка новых файлов расписания...")
     links = await fetch_pdf_links()
     if not links:
         return
 
     async with aiosqlite.connect(DB_NAME) as db:
-        for pdf_link, link_text in links:
-            async with db.execute("SELECT 1 FROM sent_files WHERE file_url = ?", (pdf_link,)) as cursor:
-                if await cursor.fetchone():
+        async with aiohttp.ClientSession() as session:
+            for pdf_link, link_text in links:
+                async with db.execute("SELECT 1 FROM sent_files WHERE file_url = ?", (pdf_link,)) as cursor:
+                    if await cursor.fetchone():
+                        continue
+
+                pdf_bytes = await download_pdf_content(session, pdf_link)
+                if not pdf_bytes:
                     continue
 
-            logging.info(f"Найдено новое расписание: {link_text}")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(pdf_link) as pdf_resp:
-                    if pdf_resp.status != 200:
-                        continue
-                    pdf_bytes = await pdf_resp.read()
+                await db.execute("INSERT INTO sent_files (file_url) VALUES (?)", (pdf_link,))
+                await db.commit()
 
-            await db.execute("INSERT INTO sent_files (file_url) VALUES (?)", (pdf_link,))
-            await db.commit()
+                async with db.execute("SELECT user_id, group_name FROM users") as cursor:
+                    users = await cursor.fetchall()
 
-            async with db.execute("SELECT user_id, group_name FROM users") as cursor:
-                users = await cursor.fetchall()
+                for user_id, group_name in users:
+                    personal_schedule = extract_group_schedule(pdf_bytes, group_name)
+                    try:
+                        if personal_schedule:
+                            await bot.send_message(
+                                user_id,
+                                f"🔔 **Новое расписание!** ({link_text})\n\n```{personal_schedule}```",
+                                parse_mode="Markdown"
+                            )
+                        await asyncio.sleep(0.2)
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки: {e}")
 
-            for user_id, group_name in users:
-                personal_schedule = extract_group_schedule(pdf_bytes, group_name)
-                try:
-                    if personal_schedule:
-                        await bot.send_message(
-                            user_id,
-                            f"🔔 **Новое расписание!** ({link_text})\n\n```{personal_schedule}```",
-                            parse_mode="Markdown"
-                        )
-                    await asyncio.sleep(0.2)
-                except Exception as e:
-                    logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
-
-# Веб-сервер для Render
 async def handle(request):
     return web.Response(text="Бот запущен!")
 
@@ -251,14 +241,12 @@ async def main():
     bot = Bot(token=TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
 
-    # Регистрация команд
     dp.message.register(cmd_start, Command("start"))
     dp.message.register(cmd_change, Command("change"))
     dp.message.register(cmd_get_schedule, Command("get"))
     dp.message.register(process_group, RegisterState.waiting_for_group)
     dp.message.register(process_date_request, GetScheduleState.waiting_for_date)
 
-    # Планировщик
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_schedule, 'interval', minutes=30, args=(bot,))
     scheduler.start()
