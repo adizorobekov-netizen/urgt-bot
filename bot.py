@@ -33,7 +33,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← ЗАМЕНИ НА СВЕЖИЙ ТОКЕН
+TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← замени если нужно
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -86,7 +86,7 @@ MONTHS_RU = {
 
 
 def normalize(s: str) -> str:
-    """Жёсткая нормализация: убираем любые пробелы, дефисы, тире, мягкие переносы, точки, запятые."""
+    """Жёсткая нормализация: убираем пробелы, дефисы, тире, мягкие переносы, точки и т.п."""
     if not s:
         return ""
     s = re.sub(r"[\s\u00a0\u200b\u00ad\-–—_.,:;()/\\|!\"'`]+", "", s)
@@ -139,22 +139,23 @@ async def init_db():
 
 
 # ============================================================
-# ПАРСИНГ PDF: PyMuPDF → pdfplumber → OCR
+# OCR — ПАРСИНГ PDF
 # ============================================================
 def extract_pdf_lines_via_ocr(pdf_bytes: bytes):
     """OCR через Tesseract (русский + английский)."""
     lines_all = []
     try:
         logging.info("[OCR] Конвертируем PDF в изображения...")
-        images = convert_from_bytes(pdf_bytes, dpi=200)
+        images = convert_from_bytes(pdf_bytes, dpi=300)
         logging.info(f"[OCR] Получено страниц: {len(images)}")
         for i, img in enumerate(images):
-            text = pytesseract.image_to_string(img, lang="rus+eng")
+            # psm 6 — единый блок текста (лучше для таблиц)
+            text = pytesseract.image_to_string(img, lang="rus+eng", config="--psm 6")
             logging.info(f"[OCR] Страница {i}: {len(text)} символов")
             for line in text.split("\n"):
                 lines_all.append(line.rstrip())
         non_empty = [l for l in lines_all if l.strip()]
-        for s in non_empty[:10]:
+        for s in non_empty[:15]:
             logging.info(f"[OCR] sample: {s[:120]!r}")
     except Exception as e:
         logging.error(f"Ошибка OCR: {e}")
@@ -162,57 +163,10 @@ def extract_pdf_lines_via_ocr(pdf_bytes: bytes):
     return lines_all
 
 
-def extract_pdf_lines_simple(pdf_bytes: bytes):
-    """PyMuPDF, потом pdfplumber."""
-    lines_all = []
-    try:
-        import fitz
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page in doc:
-            text = page.get_text("text")
-            if text:
-                for line in text.split("\n"):
-                    lines_all.append(line.rstrip())
-        doc.close()
-        logging.info(f"[ПАРСИНГ PyMuPDF] Строк: {len(lines_all)}")
-    except Exception as e:
-        logging.warning(f"PyMuPDF не сработал: {e}")
-
-    if not lines_all:
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for page in pdf.pages:
-                    text = page.extract_text()
-                    if text:
-                        for line in text.split("\n"):
-                            lines_all.append(line.rstrip())
-        except Exception as e:
-            logging.warning(f"pdfplumber не сработал: {e}")
-        logging.info(f"[ПАРСИНГ pdfplumber] Строк: {len(lines_all)}")
-    return lines_all
-
-
-def looks_like_garbage(lines: list) -> bool:
-    """Проверяет, что текст — кракозябры."""
-    sample = [l for l in lines if l.strip()][:20]
-    if not sample:
-        return True
-    bad = 0
-    for s in sample:
-        if s.count("?") >= 3:
-            bad += 1
-        elif re.search(r"[ВСАЕОА]{3,}", s):
-            bad += 1
-    logging.info(f"[ПРОВЕРКА] Плохих строк из 20: {bad}")
-    return bad >= 5
-
-
 def extract_pdf_lines(pdf_bytes: bytes) -> list:
-    lines = extract_pdf_lines_simple(pdf_bytes)
-    if not lines or looks_like_garbage(lines):
-        logging.warning("[ПАРСИНГ] Текст битый, переключаемся на OCR")
-        lines = extract_pdf_lines_via_ocr(pdf_bytes)
-    return lines
+    """Всегда используем OCR — PyMuPDF/pdfplumber дают мусор."""
+    logging.info("[ПАРСИНГ] Используем OCR")
+    return extract_pdf_lines_via_ocr(pdf_bytes)
 
 
 # ============================================================
@@ -241,7 +195,6 @@ async def find_group_schedule_text(group_name: str) -> str:
     target = normalize(group_name)
     logging.info(f"[ПОИСК] Группа '{group_name}' (норм: '{target}')")
 
-    # Варианты записи
     variants = [target]
     letters = "".join(re.findall(r"[А-ЯЁA-Z]", target))
     digits = "".join(re.findall(r"\d", target))
@@ -274,14 +227,14 @@ async def find_group_schedule_text(group_name: str) -> str:
                 break
 
         if not hit:
-            logging.warning("[ПОИСК] Совпадений нет — выводим sample строк:")
+            logging.warning("[ПОИСК] Совпадений нет — выводим первые 60 строк файла:")
             async with db.execute(
                 "SELECT line_no, line_text FROM schedule_lines "
-                "WHERE file_url = ? ORDER BY line_no LIMIT 40",
+                "WHERE file_url = ? ORDER BY line_no LIMIT 60",
                 (file_url,),
             ) as cur:
                 for ln, text in await cur.fetchall():
-                    logging.info(f"[SAMPLE] {ln}: {text[:100]!r}")
+                    logging.info(f"[SAMPLE] {ln}: {text[:120]!r}")
             return ""
 
         start_line = hit[0]
@@ -302,7 +255,7 @@ async def find_group_schedule_text(group_name: str) -> str:
                 if m:
                     other = normalize(m.group(1))
                     if other != target and len(other) >= 4:
-                        logging.info(f"[ПОИСК] Конец блока на строке {ln}: {text[:50]!r}")
+                        logging.info(f"[ПОИСК] Конец блока на строке {ln}")
                         break
             result.append(text)
         return "\n".join(result).strip()
@@ -315,20 +268,20 @@ def text_to_pdf(text: str, title: str = "Расписание") -> bytes:
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     width, height = A4
-    c.setFont(FONT_NAME, 12)
+    c.setFont(FONT_NAME, 11)
     c.drawString(40, height - 40, title)
 
     y = height - 70
     for raw_line in text.split("\n"):
         line = raw_line
         while len(line) > 0:
-            chunk, line = line[:110], line[110:]
+            chunk, line = line[:115], line[115:]
             if y < 40:
                 c.showPage()
-                c.setFont(FONT_NAME, 12)
+                c.setFont(FONT_NAME, 11)
                 y = height - 40
             c.drawString(40, y, chunk)
-            y -= 16
+            y -= 15
         y -= 2
 
     c.save()
@@ -509,7 +462,7 @@ async def process_date_request(message: Message, state: FSMContext):
         if not pdf_bytes:
             await status_msg.edit_text("❌ Не удалось скачать PDF.")
             return
-        await status_msg.edit_text("⏳ Распознаю PDF (может занять ~30 сек)...")
+        await status_msg.edit_text("⏳ Распознаю PDF (30–90 сек)...")
         lines = extract_pdf_lines(pdf_bytes)
         if not lines:
             await status_msg.edit_text("❌ PDF не распознан.")
