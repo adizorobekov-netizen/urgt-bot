@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 import aiosqlite
 import pdfplumber
 
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  
+TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ЗАМЕНИТЕ НА СВОЙ ТОКЕН ИЗ BOTFATHER ПРИ НЕОБХОДИМОСТИ
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -80,7 +80,6 @@ async def process_group(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# Функция поиска расписания конкретной группы. Возвращает текст или пустую строку, если группа не найдена.
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
         clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
@@ -213,18 +212,17 @@ async def process_date_request(message: Message, state: FSMContext):
 
     await status_msg.delete()
 
-    # Если группа найдена — отправляем текст расписания или документ с ним
+    # Если группа нашлась — отправляем текстом, если нет — отправляем PDF файл целиком
     if schedule_text:
         await message.answer(
             f"📅 **Расписание для группы {group_name} ({link_title}):**\n\n```{schedule_text}```",
             parse_mode="Markdown"
         )
     else:
-        # Если группа не найдена или пользователь ошибся — отправляем полный оригинальный PDF файл
-        file_to_send = BufferedInputFile(pdf_bytes, filename=f"{link_title}.pdf")
+        file_to_send = BufferedInputFile(pdf_bytes, filename=f"Schedule_{group_name}.pdf")
         await message.answer_document(
             file_to_send,
-            caption=f"⚠️ Группа `{group_name}` не найдена в файле. Вот полное расписание ({link_title}):",
+            caption=f"📄 Вот актуальное расписание (`{link_title}`) целиком:",
             parse_mode="Markdown"
         )
 
@@ -261,11 +259,11 @@ async def check_schedule(bot: Bot):
                                 parse_mode="Markdown"
                             )
                         else:
-                            file_to_send = BufferedInputFile(pdf_bytes, filename="schedule.pdf")
+                            file_to_send = BufferedInputFile(pdf_bytes, filename="Schedule.pdf")
                             await bot.send_document(
                                 user_id,
                                 file_to_send,
-                                caption=f"🔔 **Новое расписание!** ({link_text})\n*(Ваша группа `{group_name}` не найдена точечно, отправляем файл целиком)*",
+                                caption=f"🔔 **Новое расписание!** ({link_text})",
                                 parse_mode="Markdown"
                             )
                         await asyncio.sleep(0.3)
