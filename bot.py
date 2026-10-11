@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 import aiosqlite
 import pdfplumber
 
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"
+TOKEN = "8898464745:AAGsD4g7lKw2t03hZPXWeB1yjjir2DtkJnc"
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -80,20 +80,36 @@ async def process_group(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+# Исправленный и надежный поиск расписания по группе
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
         clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
+        
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text:
                     continue
+                
                 lines = text.split('\n')
-                for i, line in enumerate(lines):
+                block_lines = []
+                capturing = False
+                
+                for line in lines:
                     clean_line = line.replace("-", "").replace("–", "").replace(" ", "").upper()
+                    
+                    # Если находим название группы в строке
                     if clean_target in clean_line:
-                        group_text_lines = lines[i:i+20]
-                        return "\n".join(group_text_lines)
+                        capturing = True
+                    
+                    if capturing:
+                        block_lines.append(line)
+                        # Захватываем блок строк (до 30 строк под группу)
+                        if len(block_lines) >= 30:
+                            break
+                
+                if block_lines:
+                    return "\n".join(block_lines)
     except Exception as e:
         logging.error(f"Ошибка чтения PDF: {e}")
     return ""
@@ -132,11 +148,9 @@ async def download_pdf_content(session, url):
                 return None
             content = await resp.read()
             
-            # Если скачался PDF — возвращаем его
             if content.startswith(b'%PDF') or b'obj' in content[:100]:
                 return content
             
-            # Если сайт отдал HTML-страницу, пытаемся найти внутри неё реальную ссылку на PDF
             soup = BeautifulSoup(content.decode('utf-8', errors='ignore'), 'html.parser')
             for a in soup.find_all('a', href=True):
                 if '.pdf' in a['href'].lower():
@@ -196,7 +210,7 @@ async def process_date_request(message: Message, state: FSMContext):
         pdf_bytes = await download_pdf_content(session, pdf_link)
 
     if not pdf_bytes:
-        await status_msg.edit_text("❌ Не удалось скачать PDF-файл. Проверьте ссылку на сайте.")
+        await status_msg.edit_text("❌ Не удалось скачать PDF-файл.")
         return
 
     schedule_text = extract_group_schedule(pdf_bytes, group_name)
