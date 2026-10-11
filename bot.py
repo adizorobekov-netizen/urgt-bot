@@ -27,11 +27,14 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ============================================================
 # НАСТРОЙКИ — ЗАМЕНИ ТОКЕН НА СВОЙ
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"
+TOKEN = "8898464745:AAGsD4g7lKw2t03hZPXWeB1yjjir2DtkJnc"
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 
 # ============================================================
@@ -47,7 +50,10 @@ try:
         if os.path.exists(path):
             pdfmetrics.registerFont(TTFont("DejaVu", path))
             FONT_NAME = "DejaVu"
+            logging.info(f"Шрифт для кириллицы загружен: {path}")
             break
+    else:
+        logging.warning("Кириллический шрифт не найден — PDF может отображаться квадратиками")
 except Exception as e:
     logging.warning(f"Не удалось загрузить кириллический шрифт: {e}")
 
@@ -79,7 +85,8 @@ def normalize(s: str) -> str:
 
 
 def parse_date_from_title(title: str):
-    """Пытается вытащить дату из текста ссылки. Пример: 'Расписание занятий на 10 октября 2026 года' -> date(2026, 10, 10)."""
+    """Пытается вытащить дату из текста ссылки.
+    Пример: 'Расписание занятий на 10 октября 2026 года' -> date(2026, 10, 10)."""
     m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", title.lower())
     if m:
         day = int(m.group(1))
@@ -140,6 +147,7 @@ def extract_pdf_lines(pdf_bytes: bytes):
                     lines_all.append(line.rstrip())
     except Exception as e:
         logging.error(f"Ошибка чтения PDF: {e}")
+    logging.info(f"[ПАРСИНГ] Извлечено строк из PDF: {len(lines_all)}")
     return lines_all
 
 
@@ -156,13 +164,25 @@ async def save_schedule_to_db(file_url: str, file_title: str, lines: list):
             rows,
         )
         await db.commit()
+    logging.info(f"[БД] Сохранено {len(rows)} строк для файла '{file_title}'")
 
 
 async def find_group_schedule_text(group_name: str) -> str:
-    """Ищет расписание группы в БД. Возвращает текст блока или ''."""
+    """Ищет расписание группы в БД с гибкой нормализацией и логами."""
     target = normalize(group_name)
     if not target:
         return ""
+
+    # Варианты для поиска: например для "ИТ-122" → ["ИТ122", "122", "ИТ"]
+    variants = [target]
+    digits = re.findall(r"\d+", target)
+    if digits:
+        variants.append(digits[-1])
+    letters = re.findall(r"[А-ЯЁA-Z]+", target)
+    if letters:
+        variants.append(letters[0])
+
+    logging.info(f"[ПОИСК] Группа '{group_name}' → варианты: {variants}")
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
@@ -170,17 +190,42 @@ async def find_group_schedule_text(group_name: str) -> str:
         ) as cur:
             files = await cur.fetchall()
 
+        logging.info(f"[ПОИСК] Всего файлов в БД: {len(files)}")
         if not files:
+            logging.warning("[ПОИСК] В БД нет ни одной строки расписания!")
             return ""
 
-        for file_url, _file_title in files:
+        for file_url, file_title in files:
+            logging.info(f"[ПОИСК] Проверяем файл: {file_title}")
+
             async with db.execute(
-                "SELECT line_no, line_text FROM schedule_lines "
-                "WHERE file_url = ? AND line_norm LIKE ? "
-                "ORDER BY line_no LIMIT 1",
-                (file_url, f"%{target}%"),
+                "SELECT COUNT(*) FROM schedule_lines WHERE file_url = ?", (file_url,)
             ) as cur:
-                hit = await cur.fetchone()
+                cnt = (await cur.fetchone())[0]
+            logging.info(f"[ПОИСК]   строк в файле: {cnt}")
+
+            # Покажем первые 10 строк файла для отладки
+            async with db.execute(
+                "SELECT line_text FROM schedule_lines WHERE file_url = ? "
+                "ORDER BY line_no LIMIT 10",
+                (file_url,),
+            ) as cur:
+                sample = await cur.fetchall()
+            for s in sample:
+                logging.info(f"[ПОИСК]   sample: {s[0][:100]!r}")
+
+            hit = None
+            for variant in variants:
+                async with db.execute(
+                    "SELECT line_no, line_text FROM schedule_lines "
+                    "WHERE file_url = ? AND line_norm LIKE ? "
+                    "ORDER BY line_no LIMIT 1",
+                    (file_url, f"%{variant}%"),
+                ) as cur:
+                    hit = await cur.fetchone()
+                if hit:
+                    logging.info(f"[ПОИСК]   ✅ Совпадение по '{variant}': {hit[1]!r}")
+                    break
 
             if hit:
                 start_line = hit[0]
@@ -201,6 +246,7 @@ async def find_group_schedule_text(group_name: str) -> str:
                         break
                 return "\n".join(result_lines).strip()
 
+    logging.warning(f"[ПОИСК] Группа '{group_name}' не найдена ни в одном файле.")
     return ""
 
 
@@ -246,6 +292,7 @@ async def fetch_pdf_links():
         async with aiohttp.ClientSession() as session:
             async with session.get(SCHEDULE_URL, headers=headers) as resp:
                 if resp.status != 200:
+                    logging.error(f"[САЙТ] Статус {resp.status} при загрузке страницы")
                     return links
                 html = await resp.text()
 
@@ -283,6 +330,10 @@ async def fetch_pdf_links():
 
             parsed_date = parse_date_from_title(text)
             links.append((href, text, parsed_date))
+
+        logging.info(f"[САЙТ] Найдено ссылок на расписание занятий: {len(links)}")
+        for url, title, d in links:
+            logging.info(f"[САЙТ]   {title} | дата: {d} | {url}")
     except Exception as e:
         logging.error(f"Ошибка получения ссылок: {e}")
     return links
@@ -293,12 +344,14 @@ async def download_pdf_content(session, url):
     try:
         async with session.get(url, headers=headers, allow_redirects=True) as resp:
             if resp.status != 200:
+                logging.warning(f"[СКАЧ] Статус {resp.status} для {url}")
                 return None
             content = await resp.read()
             if content.startswith(b"%PDF") or b"obj" in content[:100]:
                 return content
 
             # Если это HTML-страница — ищем внутри ссылку на PDF
+            logging.info(f"[СКАЧ] {url} — не PDF, ищем внутри ссылку на PDF")
             soup = BeautifulSoup(content.decode("utf-8", errors="ignore"), "html.parser")
             for a in soup.find_all("a", href=True):
                 if ".pdf" in a["href"].lower():
@@ -314,6 +367,7 @@ async def download_pdf_content(session, url):
                         if pdf_resp.status == 200:
                             pdf_content = await pdf_resp.read()
                             if pdf_content.startswith(b"%PDF") or b"obj" in pdf_content[:100]:
+                                logging.info(f"[СКАЧ] Найден PDF внутри: {pdf_url}")
                                 return pdf_content
     except Exception as e:
         logging.error(f"Ошибка загрузки PDF {url}: {e}")
@@ -426,6 +480,8 @@ async def process_date_request(message: Message, state: FSMContext):
             matched = links[0]
 
     pdf_link, link_title, _ = matched
+    logging.info(f"[ЗАПРОС] Пользователь {message.from_user.id}, группа {group_name}, "
+                 f"выбран файл: {link_title} | {pdf_link}")
 
     # Проверяем, есть ли уже строки этого файла в БД
     async with aiosqlite.connect(DB_NAME) as db:
@@ -442,6 +498,9 @@ async def process_date_request(message: Message, state: FSMContext):
             await status_msg.edit_text("❌ Не удалось скачать PDF-файл.")
             return
         lines = extract_pdf_lines(pdf_bytes)
+        if not lines:
+            await status_msg.edit_text("❌ PDF не содержит текста (возможно, это скан).")
+            return
         await save_schedule_to_db(pdf_link, link_title, lines)
 
     schedule_text = await find_group_schedule_text(group_name)
@@ -569,6 +628,7 @@ async def start_web_server():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logging.info(f"Веб-сервер запущен на порту {port}")
 
 
 # ============================================================
