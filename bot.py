@@ -9,13 +9,13 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, BufferedInputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
 import aiosqlite
 import pdfplumber
 
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"
+TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -80,7 +80,7 @@ async def process_group(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# Исправленный и надежный поиск расписания по группе
+# Функция поиска расписания конкретной группы. Возвращает текст или пустую строку, если группа не найдена.
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
         clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
@@ -97,14 +97,11 @@ def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
                 
                 for line in lines:
                     clean_line = line.replace("-", "").replace("–", "").replace(" ", "").upper()
-                    
-                    # Если находим название группы в строке
                     if clean_target in clean_line:
                         capturing = True
                     
                     if capturing:
                         block_lines.append(line)
-                        # Захватываем блок строк (до 30 строк под группу)
                         if len(block_lines) >= 30:
                             break
                 
@@ -128,7 +125,7 @@ async def fetch_pdf_links():
         for a in soup.find_all('a', href=True):
             href = a['href']
             text = a.get_text(strip=True)
-            if '.pdf' in href.lower() or 'расписание' in text.lower() or 'расписание' in href.lower():
+            if '.pdf' in href.lower() or 'расписание' in text.lower():
                 if href.startswith('//'):
                     href = 'https:' + href
                 elif href.startswith('/'):
@@ -147,7 +144,6 @@ async def download_pdf_content(session, url):
             if resp.status != 200:
                 return None
             content = await resp.read()
-            
             if content.startswith(b'%PDF') or b'obj' in content[:100]:
                 return content
             
@@ -215,17 +211,24 @@ async def process_date_request(message: Message, state: FSMContext):
 
     schedule_text = extract_group_schedule(pdf_bytes, group_name)
 
+    await status_msg.delete()
+
+    # Если группа найдена — отправляем текст расписания или документ с ним
     if schedule_text:
-        await status_msg.edit_text(
-            f"📅 **Расписание ({link_title}):**\n\n```{schedule_text}```",
+        await message.answer(
+            f"📅 **Расписание для группы {group_name} ({link_title}):**\n\n```{schedule_text}```",
             parse_mode="Markdown"
         )
     else:
-        await status_msg.edit_text(
-            f"📄 Файл **{link_title}** найден, но строчек для группы `{group_name}` в нем не обнаружено.",
+        # Если группа не найдена или пользователь ошибся — отправляем полный оригинальный PDF файл
+        file_to_send = BufferedInputFile(pdf_bytes, filename=f"{link_title}.pdf")
+        await message.answer_document(
+            file_to_send,
+            caption=f"⚠️ Группа `{group_name}` не найдена в файле. Вот полное расписание ({link_title}):",
             parse_mode="Markdown"
         )
 
+# Автоматическая проверка и рассылка новых файлов
 async def check_schedule(bot: Bot):
     links = await fetch_pdf_links()
     if not links:
@@ -257,9 +260,17 @@ async def check_schedule(bot: Bot):
                                 f"🔔 **Новое расписание!** ({link_text})\n\n```{personal_schedule}```",
                                 parse_mode="Markdown"
                             )
-                        await asyncio.sleep(0.2)
+                        else:
+                            file_to_send = BufferedInputFile(pdf_bytes, filename="schedule.pdf")
+                            await bot.send_document(
+                                user_id,
+                                file_to_send,
+                                caption=f"🔔 **Новое расписание!** ({link_text})\n*(Ваша группа `{group_name}` не найдена точечно, отправляем файл целиком)*",
+                                parse_mode="Markdown"
+                            )
+                        await asyncio.sleep(0.3)
                     except Exception as e:
-                        logging.error(f"Ошибка отправки: {e}")
+                        logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
 
 async def handle(request):
     return web.Response(text="Бот запущен!")
