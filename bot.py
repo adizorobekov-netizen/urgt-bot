@@ -50,7 +50,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 await message.answer(
                     f"Привет! Твоя группа: **{row[0]}**.\n\n"
                     "📌 **Команды:**\n"
-                    "• /get — запросить расписание на нужную дату (например, на 10 число)\n"
+                    "• /get — запросить расписание на нужную дату (например, на 10 или 12.10)\n"
                     "• /change — сменить учебную группу",
                     parse_mode="Markdown"
                 )
@@ -66,7 +66,6 @@ async def cmd_change(message: Message, state: FSMContext):
     await state.set_state(RegisterState.waiting_for_group)
 
 async def process_group(message: Message, state: FSMContext):
-    # Очищаем название группы при сохранении
     group_name = message.text.strip().upper()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -83,9 +82,7 @@ async def process_group(message: Message, state: FSMContext):
 
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
-        # Убираем дефисы, тире и пробелы для точного совпадения
         clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
-        
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
@@ -95,7 +92,6 @@ def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
                 for i, line in enumerate(lines):
                     clean_line = line.replace("-", "").replace("–", "").replace(" ", "").upper()
                     if clean_target in clean_line:
-                        # Захватываем строки под найденной группой
                         group_text_lines = lines[i:i+20]
                         return "\n".join(group_text_lines)
     except Exception as e:
@@ -129,14 +125,34 @@ async def fetch_pdf_links():
     return links
 
 async def download_pdf_content(session, url):
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         async with session.get(url, headers=headers, allow_redirects=True) as resp:
             if resp.status != 200:
                 return None
             content = await resp.read()
+            
+            # Если скачался PDF — возвращаем его
             if content.startswith(b'%PDF') or b'obj' in content[:100]:
                 return content
+            
+            # Если сайт отдал HTML-страницу, пытаемся найти внутри неё реальную ссылку на PDF
+            soup = BeautifulSoup(content.decode('utf-8', errors='ignore'), 'html.parser')
+            for a in soup.find_all('a', href=True):
+                if '.pdf' in a['href'].lower():
+                    pdf_url = a['href']
+                    if pdf_url.startswith('//'):
+                        pdf_url = 'https:' + pdf_url
+                    elif pdf_url.startswith('/'):
+                        pdf_url = 'https://urgt66.ru' + pdf_url
+                    elif not pdf_url.startswith('http'):
+                        pdf_url = url.rsplit('/', 1)[0] + '/' + pdf_url
+                    
+                    async with session.get(pdf_url, headers=headers, allow_redirects=True) as pdf_resp:
+                        if pdf_resp.status == 200:
+                            pdf_content = await pdf_resp.read()
+                            if pdf_content.startswith(b'%PDF') or b'obj' in pdf_content[:100]:
+                                return pdf_content
     except Exception as e:
         logging.error(f"Ошибка загрузки PDF {url}: {e}")
     return None
@@ -180,7 +196,7 @@ async def process_date_request(message: Message, state: FSMContext):
         pdf_bytes = await download_pdf_content(session, pdf_link)
 
     if not pdf_bytes:
-        await status_msg.edit_text("❌ Не удалось скачать PDF-файл.")
+        await status_msg.edit_text("❌ Не удалось скачать PDF-файл. Проверьте ссылку на сайте.")
         return
 
     schedule_text = extract_group_schedule(pdf_bytes, group_name)
