@@ -26,9 +26,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 
 # ============================================================
-# НАСТРОЙКИ — ВСТАВЬ НОВЫЙ ТОКЕН!
+# НАСТРОЙКИ
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← ЗАМЕНИ НА НОВЫЙ
+TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← ЗАМЕНИ НА СВОЙ (свежий!)
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -39,7 +39,7 @@ logging.basicConfig(
 
 
 # ============================================================
-# ШРИФТ ДЛЯ КИРИЛЛИЦЫ В PDF
+# ШРИФТ ДЛЯ КИРИЛЛИЦЫ
 # ============================================================
 FONT_NAME = "Helvetica"
 try:
@@ -81,14 +81,12 @@ MONTHS_RU = {
 
 
 def normalize(s: str) -> str:
-    """Убирает пробелы/дефисы/переносы и переводит в верхний регистр."""
     if not s:
         return ""
     return re.sub(r"[\s\-–—\u00a0]+", "", s).upper()
 
 
 def parse_date_from_title(title: str):
-    """Пытается вытащить дату из текста ссылки."""
     m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", title.lower())
     if m:
         day = int(m.group(1))
@@ -142,27 +140,53 @@ async def init_db():
 
 
 # ============================================================
-# ПАРСИНГ PDF — СТРОКИ
+# ПАРСИНГ PDF — СНАЧАЛА PyMuPDF, ПОТОМ pdfplumber
 # ============================================================
 def extract_pdf_lines(pdf_bytes: bytes):
+    """Извлекает строки: сначала PyMuPDF (fitz), если не вышло — pdfplumber."""
     lines_all = []
+
+    # --- Попытка 1: PyMuPDF ---
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text:
-                    continue
-                for line in text.split("\n"):
-                    lines_all.append(line.rstrip())
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page in doc:
+            text = page.get_text("text")
+            if not text:
+                continue
+            for line in text.split("\n"):
+                lines_all.append(line.rstrip())
+        doc.close()
+        logging.info(f"[ПАРСИНГ PyMuPDF] Извлечено строк: {len(lines_all)}")
+        # Проверим первые 5 непустых строк на «кракозябры»
+        sample = [l for l in lines_all if l.strip()][:5]
+        for s in sample:
+            logging.info(f"[ПАРСИНГ PyMuPDF] sample: {s[:120]!r}")
+        # Если в sample слишком много "?" — считаем, что кодировка битая
+        bad = sum(1 for s in sample if s.count("?") >= 3)
+        if bad >= 3:
+            logging.warning("[ПАРСИНГ] PyMuPDF вернул много '?' — возможно битая кодировка")
     except Exception as e:
-        logging.error(f"Ошибка чтения PDF (строки): {e}")
-    logging.info(f"[ПАРСИНГ] Извлечено строк: {len(lines_all)}")
+        logging.error(f"Ошибка PyMuPDF: {e}")
+
+    # --- Если PyMuPDF ничего не дал — pdfplumber ---
+    if not lines_all:
+        logging.info("[ПАРСИНГ] PyMuPDF пусто, пробуем pdfplumber")
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if not text:
+                        continue
+                    for line in text.split("\n"):
+                        lines_all.append(line.rstrip())
+        except Exception as e:
+            logging.error(f"Ошибка pdfplumber: {e}")
+        logging.info(f"[ПАРСИНГ pdfplumber] Извлечено строк: {len(lines_all)}")
+
     return lines_all
 
 
-# ============================================================
-# ПАРСИНГ PDF — ТАБЛИЦЫ
-# ============================================================
 def extract_pdf_tables(pdf_bytes: bytes):
     """Возвращает список таблиц (по одной на каждую страницу)."""
     tables_all = []
@@ -221,7 +245,6 @@ async def save_tables_to_db(file_url: str, file_title: str, tables: list):
 # ПОИСК ГРУППЫ В ТАБЛИЦАХ
 # ============================================================
 def find_group_in_tables(tables: list, group_name: str) -> str:
-    """Ищет расписание группы в распарсенных таблицах."""
     target = normalize(group_name)
     logging.info(f"[ТАБЛИЦА] Ищем группу '{group_name}' (норм: '{target}')")
 
@@ -236,7 +259,6 @@ def find_group_in_tables(tables: list, group_name: str) -> str:
                 if not cell:
                     continue
                 cell_norm = normalize(cell)
-                # Название группы: 2-4 буквы + 2-3 цифры, или с суффиксом /1
                 if re.fullmatch(r"[А-ЯЁA-Z]{2,4}\d{2,3}[\/\d]*", cell_norm):
                     group_cols[col_idx] = cell_norm
 
@@ -244,12 +266,10 @@ def find_group_in_tables(tables: list, group_name: str) -> str:
                 logging.info(f"[ТАБЛИЦА] Строка заголовков (стр. {row_idx}): {group_cols}")
 
                 target_col = None
-                # Точное совпадение
                 for col_idx, gname in group_cols.items():
                     if gname == target:
                         target_col = col_idx
                         break
-                # Если не нашли — по вхождению
                 if target_col is None:
                     for col_idx, gname in group_cols.items():
                         if target in gname or gname in target:
@@ -262,7 +282,6 @@ def find_group_in_tables(tables: list, group_name: str) -> str:
 
                 logging.info(f"[ТАБЛИЦА] ✅ Нашли столбец: {target_col}")
 
-                # Собираем данные только из этого столбца
                 result = []
                 for r in range(row_idx, len(table)):
                     if target_col >= len(table[r]):
@@ -283,7 +302,7 @@ def find_group_in_tables(tables: list, group_name: str) -> str:
 
 
 # ============================================================
-# ПОИСК ГРУППЫ В СТРОКАХ (FALLBACK)
+# ПОИСК В СТРОКАХ (FALLBACK)
 # ============================================================
 async def _find_group_in_lines(group_name: str, files):
     target = normalize(group_name)
@@ -320,7 +339,6 @@ async def _find_group_in_lines(group_name: str, files):
 # ОБЩАЯ ФУНКЦИЯ ПОИСКА
 # ============================================================
 async def find_group_schedule_text(group_name: str) -> str:
-    """Ищет расписание группы: сначала по таблицам, потом fallback по строкам."""
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT DISTINCT file_url, file_title FROM schedule_lines ORDER BY id DESC"
@@ -331,10 +349,10 @@ async def find_group_schedule_text(group_name: str) -> str:
         logging.warning("[ПОИСК] В БД нет файлов")
         return ""
 
-    # 1. Пробуем таблицы (в самом свежем файле)
     file_url, file_title = files[0]
     logging.info(f"[ПОИСК] Работаем с файлом: {file_title}")
 
+    # 1. Таблицы
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT table_json FROM schedule_tables WHERE file_url = ? LIMIT 1",
@@ -351,7 +369,7 @@ async def find_group_schedule_text(group_name: str) -> str:
         except Exception as e:
             logging.error(f"Ошибка парсинга таблиц из БД: {e}")
 
-    # 2. Fallback по строкам
+    # 2. Fallback
     logging.info("[ПОИСК] Fallback на поиск по строкам")
     return await _find_group_in_lines(group_name, files)
 
@@ -385,7 +403,7 @@ def text_to_pdf(text: str, title: str = "Расписание") -> bytes:
 
 
 # ============================================================
-# ПОЛУЧЕНИЕ ССЫЛОК С САЙТА
+# ССЫЛКИ С САЙТА
 # ============================================================
 async def fetch_pdf_links():
     links = []
@@ -548,7 +566,6 @@ async def process_date_request(message: Message, state: FSMContext):
         await status_msg.edit_text("❌ Не удалось найти расписание занятий на сайте.")
         return
 
-    # Разбор даты от пользователя
     user_day = None
     user_month = None
     m = re.match(r"^(\d{1,2})(?:[.\-/](\d{1,2}))?", search_date)
@@ -575,7 +592,6 @@ async def process_date_request(message: Message, state: FSMContext):
     pdf_link, link_title, _ = matched
     logging.info(f"[ЗАПРОС] user={message.from_user.id} group={group_name} file={link_title}")
 
-    # Проверка: есть ли уже в БД
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT 1 FROM schedule_lines WHERE file_url = ? LIMIT 1", (pdf_link,)
@@ -631,7 +647,7 @@ async def process_date_request(message: Message, state: FSMContext):
 
 
 # ============================================================
-# АВТОМАТИЧЕСКАЯ РАССЫЛКА
+# АВТОРАССЫЛКА
 # ============================================================
 async def check_schedule(bot: Bot):
     links = await fetch_pdf_links()
