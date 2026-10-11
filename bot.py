@@ -33,7 +33,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7lKw2t03hZPXWeB1yjjir2DtkJnc"  # ← при необходимости замени
+TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← при необходимости замени
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
