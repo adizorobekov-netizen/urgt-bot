@@ -33,7 +33,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← замени если нужно
+TOKEN = "8898464745:AAGsD4g7lKw2t03hZPXWeB1yjjir2DtkJnc"  # ← при необходимости замени
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -86,7 +86,7 @@ MONTHS_RU = {
 
 
 def normalize(s: str) -> str:
-    """Жёсткая нормализация: убираем пробелы, дефисы, тире, мягкие переносы, точки и т.п."""
+    """Жёсткая нормализация: убираем пробелы, дефисы, тире, точки, запятые и т.п."""
     if not s:
         return ""
     s = re.sub(r"[\s\u00a0\u200b\u00ad\-–—_.,:;()/\\|!\"'`]+", "", s)
@@ -139,34 +139,67 @@ async def init_db():
 
 
 # ============================================================
-# OCR — ПАРСИНГ PDF
+# OCR — УСКОРЕННЫЙ ПАРСИНГ PDF
 # ============================================================
 def extract_pdf_lines_via_ocr(pdf_bytes: bytes):
-    """OCR через Tesseract (русский + английский)."""
+    """OCR через Tesseract с ускорением: DPI 150 + обрезка верхних 60% + таймаут."""
     lines_all = []
     try:
-        logging.info("[OCR] Конвертируем PDF в изображения...")
-        images = convert_from_bytes(pdf_bytes, dpi=300)
+        logging.info("[OCR] Конвертируем PDF в изображения (dpi=150)...")
+        images = convert_from_bytes(
+            pdf_bytes,
+            dpi=150,
+            fmt="jpeg",
+            thread_count=1,
+        )
         logging.info(f"[OCR] Получено страниц: {len(images)}")
+
         for i, img in enumerate(images):
-            # psm 6 — единый блок текста (лучше для таблиц)
-            text = pytesseract.image_to_string(img, lang="rus+eng", config="--psm 6")
-            logging.info(f"[OCR] Страница {i}: {len(text)} символов")
-            for line in text.split("\n"):
-                lines_all.append(line.rstrip())
+            try:
+                w, h = img.size
+                cropped = img.crop((0, 0, w, int(h * 0.6)))
+                logging.info(f"[OCR] Страница {i}: обрезали до {cropped.size}")
+
+                text = pytesseract.image_to_string(
+                    cropped,
+                    lang="rus+eng",
+                    config="--psm 6 --oem 1",
+                    timeout=45,
+                )
+                logging.info(f"[OCR] Страница {i}: {len(text)} символов")
+                for line in text.split("\n"):
+                    lines_all.append(line.rstrip())
+            except RuntimeError as e:
+                logging.error(f"[OCR] Таймаут на странице {i}: {e}")
+            except Exception as e:
+                logging.error(f"[OCR] Ошибка на странице {i}: {e}", exc_info=True)
+
         non_empty = [l for l in lines_all if l.strip()]
         for s in non_empty[:15]:
             logging.info(f"[OCR] sample: {s[:120]!r}")
     except Exception as e:
-        logging.error(f"Ошибка OCR: {e}")
+        logging.error(f"[OCR] Общая ошибка: {e}", exc_info=True)
     logging.info(f"[OCR] Извлечено строк: {len(lines_all)}")
     return lines_all
 
 
 def extract_pdf_lines(pdf_bytes: bytes) -> list:
-    """Всегда используем OCR — PyMuPDF/pdfplumber дают мусор."""
-    logging.info("[ПАРСИНГ] Используем OCR")
-    return extract_pdf_lines_via_ocr(pdf_bytes)
+    """Пробуем OCR. Если пусто — PyMuPDF как last resort."""
+    lines = extract_pdf_lines_via_ocr(pdf_bytes)
+    if not lines:
+        logging.warning("[ПАРСИНГ] OCR не дал результата, пробуем PyMuPDF")
+        try:
+            import fitz
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            for page in doc:
+                text = page.get_text("text")
+                if text:
+                    for line in text.split("\n"):
+                        lines.append(line.rstrip())
+            doc.close()
+        except Exception as e:
+            logging.error(f"PyMuPDF fallback: {e}")
+    return lines
 
 
 # ============================================================
@@ -212,7 +245,6 @@ async def find_group_schedule_text(group_name: str) -> str:
         file_url, file_title = row
         logging.info(f"[ПОИСК] Файл: {file_title}")
 
-        # Ищем по вариантам
         hit = None
         for v in variants:
             async with db.execute(
@@ -239,7 +271,6 @@ async def find_group_schedule_text(group_name: str) -> str:
 
         start_line = hit[0]
 
-        # Собираем блок до следующей группы
         async with db.execute(
             "SELECT line_no, line_text FROM schedule_lines "
             "WHERE file_url = ? AND line_no >= ? "
