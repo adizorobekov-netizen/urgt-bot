@@ -33,7 +33,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← вставь актуальный
+TOKEN = "8898464745:AAGsD4g7lKw2t03hZPXWeB1yjjir2DtkJnc"  # ← ЗАМЕНИ НА СВЕЖИЙ ТОКЕН
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -86,9 +86,11 @@ MONTHS_RU = {
 
 
 def normalize(s: str) -> str:
+    """Жёсткая нормализация: убираем любые пробелы, дефисы, тире, мягкие переносы, точки, запятые."""
     if not s:
         return ""
-    return re.sub(r"[\s\-–—\u00a0]+", "", s).upper()
+    s = re.sub(r"[\s\u00a0\u200b\u00ad\-–—_.,:;()/\\|!\"'`]+", "", s)
+    return s.upper()
 
 
 def parse_date_from_title(title: str):
@@ -137,39 +139,31 @@ async def init_db():
 
 
 # ============================================================
-# OCR — ПАРСИНГ PDF ЧЕРЕЗ TESSERACT
+# ПАРСИНГ PDF: PyMuPDF → pdfplumber → OCR
 # ============================================================
 def extract_pdf_lines_via_ocr(pdf_bytes: bytes):
-    """PDF → картинки → OCR (Tesseract, русский)."""
+    """OCR через Tesseract (русский + английский)."""
     lines_all = []
     try:
         logging.info("[OCR] Конвертируем PDF в изображения...")
         images = convert_from_bytes(pdf_bytes, dpi=200)
         logging.info(f"[OCR] Получено страниц: {len(images)}")
-
         for i, img in enumerate(images):
-            # Распознаём русский + английский
             text = pytesseract.image_to_string(img, lang="rus+eng")
             logging.info(f"[OCR] Страница {i}: {len(text)} символов")
             for line in text.split("\n"):
                 lines_all.append(line.rstrip())
-
-        # Логируем первые строки для отладки
         non_empty = [l for l in lines_all if l.strip()]
         for s in non_empty[:10]:
             logging.info(f"[OCR] sample: {s[:120]!r}")
-
     except Exception as e:
         logging.error(f"Ошибка OCR: {e}")
     logging.info(f"[OCR] Извлечено строк: {len(lines_all)}")
     return lines_all
 
 
-# ============================================================
-# FALLBACK — PyMuPDF / pdfplumber
-# ============================================================
 def extract_pdf_lines_simple(pdf_bytes: bytes):
-    """Пробуем PyMuPDF, потом pdfplumber — на случай нормального PDF."""
+    """PyMuPDF, потом pdfplumber."""
     lines_all = []
     try:
         import fitz
@@ -199,35 +193,30 @@ def extract_pdf_lines_simple(pdf_bytes: bytes):
 
 
 def looks_like_garbage(lines: list) -> bool:
-    """Проверяем: похоже ли, что текст — кракозябры.
-    Если много '?' или нетипичных символов — считаем мусором."""
+    """Проверяет, что текст — кракозябры."""
     sample = [l for l in lines if l.strip()][:20]
     if not sample:
         return True
     bad = 0
     for s in sample:
-        # если в строке >= 3 вопросиков, или много символов типа > < @ — мусор
         if s.count("?") >= 3:
             bad += 1
-        elif re.search(r"[ВСАЕОА]{3,}", s):  # частый признак "битой кириллицы"
+        elif re.search(r"[ВСАЕОА]{3,}", s):
             bad += 1
     logging.info(f"[ПРОВЕРКА] Плохих строк из 20: {bad}")
     return bad >= 5
 
 
 def extract_pdf_lines(pdf_bytes: bytes) -> list:
-    """Главная функция: сначала простой парсинг, если мусор — OCR."""
     lines = extract_pdf_lines_simple(pdf_bytes)
-
     if not lines or looks_like_garbage(lines):
         logging.warning("[ПАРСИНГ] Текст битый, переключаемся на OCR")
         lines = extract_pdf_lines_via_ocr(pdf_bytes)
-
     return lines
 
 
 # ============================================================
-# СОХРАНЕНИЕ / ПОИСК
+# СОХРАНЕНИЕ В БД
 # ============================================================
 async def save_schedule_to_db(file_url: str, file_title: str, lines: list):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -245,41 +234,61 @@ async def save_schedule_to_db(file_url: str, file_title: str, lines: list):
     logging.info(f"[БД] Сохранено строк: {len(rows)}")
 
 
+# ============================================================
+# ПОИСК ГРУППЫ
+# ============================================================
 async def find_group_schedule_text(group_name: str) -> str:
-    """Ищем группу в строках: сначала точное совпадение, потом с суффиксами."""
     target = normalize(group_name)
     logging.info(f"[ПОИСК] Группа '{group_name}' (норм: '{target}')")
 
+    # Варианты записи
+    variants = [target]
+    letters = "".join(re.findall(r"[А-ЯЁA-Z]", target))
+    digits = "".join(re.findall(r"\d", target))
+    if letters and digits:
+        variants.append(f"{letters}{digits}")
+
     async with aiosqlite.connect(DB_NAME) as db:
-        # Свежий файл
         async with db.execute(
             "SELECT DISTINCT file_url, file_title FROM schedule_lines ORDER BY id DESC LIMIT 1"
         ) as cur:
             row = await cur.fetchone()
         if not row:
+            logging.warning("[ПОИСК] В БД нет файлов")
             return ""
         file_url, file_title = row
         logging.info(f"[ПОИСК] Файл: {file_title}")
 
-        # 1. Точное совпадение нормализованных форм
-        async with db.execute(
-            "SELECT line_no, line_text FROM schedule_lines "
-            "WHERE file_url = ? AND line_norm LIKE ? "
-            "ORDER BY line_no LIMIT 1",
-            (file_url, f"%{target}%"),
-        ) as cur:
-            hit = await cur.fetchone()
+        # Ищем по вариантам
+        hit = None
+        for v in variants:
+            async with db.execute(
+                "SELECT line_no, line_text FROM schedule_lines "
+                "WHERE file_url = ? AND line_norm LIKE ? "
+                "ORDER BY line_no LIMIT 1",
+                (file_url, f"%{v}%"),
+            ) as cur:
+                hit = await cur.fetchone()
+            if hit:
+                logging.info(f"[ПОИСК] Совпадение по '{v}': {hit[1]!r}")
+                break
 
         if not hit:
-            logging.warning(f"[ПОИСК] Точного совпадения нет")
+            logging.warning("[ПОИСК] Совпадений нет — выводим sample строк:")
+            async with db.execute(
+                "SELECT line_no, line_text FROM schedule_lines "
+                "WHERE file_url = ? ORDER BY line_no LIMIT 40",
+                (file_url,),
+            ) as cur:
+                for ln, text in await cur.fetchall():
+                    logging.info(f"[SAMPLE] {ln}: {text[:100]!r}")
             return ""
 
         start_line = hit[0]
-        logging.info(f"[ПОИСК] Совпадение: {hit[1]!r} (стр. {start_line})")
 
-        # 2. Собираем блок: от строки с группой до следующей группы
+        # Собираем блок до следующей группы
         async with db.execute(
-            "SELECT line_no, line_text, line_norm FROM schedule_lines "
+            "SELECT line_no, line_text FROM schedule_lines "
             "WHERE file_url = ? AND line_no >= ? "
             "ORDER BY line_no LIMIT 60",
             (file_url, start_line),
@@ -287,18 +296,15 @@ async def find_group_schedule_text(group_name: str) -> str:
             block = await cur.fetchall()
 
         result = []
-        for idx, (ln, text, norm) in enumerate(block):
-            # Пропускаем строки, где группа фигурирует как заголовок другой группы
+        for idx, (ln, text) in enumerate(block):
             if idx > 0:
-                # Проверим: не начинается ли строка с "ИТ-XXX" (другой группы)
-                m = re.match(r"^\s*([А-ЯЁA-Z]{2,4}[\-\s]?\d{2,3})", text)
+                m = re.match(r"^\s*([А-ЯЁA-Z]{2,4}[\s\-–—]?\d{2,3})", text.strip())
                 if m:
                     other = normalize(m.group(1))
                     if other != target and len(other) >= 4:
-                        logging.info(f"[ПОИСК] Прерываем на строке '{text[:50]}'")
+                        logging.info(f"[ПОИСК] Конец блока на строке {ln}: {text[:50]!r}")
                         break
             result.append(text)
-
         return "\n".join(result).strip()
 
 
@@ -369,8 +375,6 @@ async def fetch_pdf_links():
             links.append((href, text, parsed_date))
 
         logging.info(f"[САЙТ] Найдено ссылок: {len(links)}")
-        for url, title, d in links:
-            logging.info(f"[САЙТ] {title} | {d} | {url}")
     except Exception as e:
         logging.error(f"Ошибка получения ссылок: {e}")
     return links
@@ -585,7 +589,7 @@ async def check_schedule(bot: Bot):
                             await bot.send_document(
                                 uid,
                                 BufferedInputFile(pdf_bytes, filename="Schedule_full.pdf"),
-                                caption=f"🔔 Новое расписание ({link_text}). Группа **{gname}** не найдена — полный файл.",
+                                caption=f"🔔 Новое расписание ({link_text}). Группа **{gname}** не найдена.",
                                 parse_mode="Markdown",
                             )
                         await asyncio.sleep(0.3)
