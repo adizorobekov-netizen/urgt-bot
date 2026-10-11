@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 import aiosqlite
 import pdfplumber
 
-# ДАННЫЕ БОТА
+# ДАННЫЕ БОТА (ЗАМЕНИТЕ ТОКЕН ПРИ НЕОБХОДИМОСТИ)
 TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
@@ -60,7 +60,7 @@ async def cmd_start(message: Message, state: FSMContext):
                 )
             else:
                 await message.answer(
-                    "Привет! Напиши название своей группы (например: ИТ-12 или ИС-21), чтобы я присылал расписание:",
+                    "Привет! Напиши название своей группы (например: ИТ-122 или ИС-21), чтобы я присылал расписание:",
                     parse_mode="Markdown"
                 )
                 await state.set_state(RegisterState.waiting_for_group)
@@ -86,28 +86,24 @@ async def process_group(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-# Поиск расписания группы в PDF
+# Улучшенный поиск расписания группы в PDF с учетом дефисов и тире
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
+        clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
+        
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            group_text_lines = []
-            found = False
             for page in pdf.pages:
                 text = page.extract_text()
                 if not text:
                     continue
+                
                 lines = text.split('\n')
-                for line in lines:
-                    if group_name in line.upper():
-                        found = True
-                    if found:
-                        group_text_lines.append(line)
-                        if len(group_text_lines) > 20:
-                            break
-                if found:
-                    break
-            if group_text_lines:
-                return "\n".join(group_text_lines)
+                for i, line in enumerate(lines):
+                    clean_line = line.replace("-", "").replace("–", "").replace(" ", "").upper()
+                    
+                    if clean_target in clean_line:
+                        group_text_lines = lines[i:i+20]
+                        return "\n".join(group_text_lines)
     except Exception as e:
         logging.error(f"Ошибка чтения PDF: {e}")
     return ""
@@ -163,7 +159,6 @@ async def process_date_request(message: Message, state: FSMContext):
         await status_msg.edit_text("❌ Не удалось загрузить файлы с сайта техникума.")
         return
 
-    # Фильтруем ссылки по вхождению указанного числа/даты
     matched_links = []
     for url, text in links:
         combined_title = f"{text} {url}".lower()
@@ -171,7 +166,6 @@ async def process_date_request(message: Message, state: FSMContext):
             matched_links.append((url, text))
 
     if not matched_links:
-        # Если совпадений нет, берем последний доступный PDF-файл с сайта
         matched_links = [links[0]]
 
     pdf_link, link_title = matched_links[0]
