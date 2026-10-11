@@ -3,6 +3,7 @@ import logging
 import os
 import io
 import re
+import json
 import aiohttp
 from datetime import datetime
 from aiohttp import web
@@ -25,9 +26,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 
 # ============================================================
-# НАСТРОЙКИ — ЗАМЕНИ ТОКЕН НА СВОЙ
+# НАСТРОЙКИ — ВСТАВЬ НОВЫЙ ТОКЕН!
 # ============================================================
-TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"
+TOKEN = "8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc"  # ← ЗАМЕНИ НА НОВЫЙ
 SCHEDULE_URL = "https://urgt66.ru/partition/136056/"
 DB_NAME = "users.db"
 
@@ -80,13 +81,14 @@ MONTHS_RU = {
 
 
 def normalize(s: str) -> str:
-    """Убирает пробелы/дефисы и переводит в верхний регистр."""
-    return re.sub(r"[\s\-–—]+", "", s).upper()
+    """Убирает пробелы/дефисы/переносы и переводит в верхний регистр."""
+    if not s:
+        return ""
+    return re.sub(r"[\s\-–—\u00a0]+", "", s).upper()
 
 
 def parse_date_from_title(title: str):
-    """Пытается вытащить дату из текста ссылки.
-    Пример: 'Расписание занятий на 10 октября 2026 года' -> date(2026, 10, 10)."""
+    """Пытается вытащить дату из текста ссылки."""
     m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", title.lower())
     if m:
         day = int(m.group(1))
@@ -127,13 +129,20 @@ async def init_db():
                 line_norm TEXT
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_tables (
+                file_url TEXT PRIMARY KEY,
+                file_title TEXT,
+                table_json TEXT
+            )
+        """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_norm ON schedule_lines (line_norm)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_file ON schedule_lines (file_url)")
         await db.commit()
 
 
 # ============================================================
-# ПАРСИНГ PDF И СОХРАНЕНИЕ В БД
+# ПАРСИНГ PDF — СТРОКИ
 # ============================================================
 def extract_pdf_lines(pdf_bytes: bytes):
     lines_all = []
@@ -146,11 +155,41 @@ def extract_pdf_lines(pdf_bytes: bytes):
                 for line in text.split("\n"):
                     lines_all.append(line.rstrip())
     except Exception as e:
-        logging.error(f"Ошибка чтения PDF: {e}")
-    logging.info(f"[ПАРСИНГ] Извлечено строк из PDF: {len(lines_all)}")
+        logging.error(f"Ошибка чтения PDF (строки): {e}")
+    logging.info(f"[ПАРСИНГ] Извлечено строк: {len(lines_all)}")
     return lines_all
 
 
+# ============================================================
+# ПАРСИНГ PDF — ТАБЛИЦЫ
+# ============================================================
+def extract_pdf_tables(pdf_bytes: bytes):
+    """Возвращает список таблиц (по одной на каждую страницу)."""
+    tables_all = []
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                tables = page.extract_tables()
+                if not tables:
+                    continue
+                for t in tables:
+                    cleaned = []
+                    for row in t:
+                        cleaned.append([
+                            (cell or "").replace("\n", " ").strip()
+                            for cell in row
+                        ])
+                    tables_all.append(cleaned)
+                logging.info(f"[ПАРСИНГ] Страница {page_num}: таблиц {len(tables)}")
+    except Exception as e:
+        logging.error(f"Ошибка парсинга таблиц: {e}")
+    logging.info(f"[ПАРСИНГ] Всего таблиц: {len(tables_all)}")
+    return tables_all
+
+
+# ============================================================
+# СОХРАНЕНИЕ В БД
+# ============================================================
 async def save_schedule_to_db(file_url: str, file_title: str, lines: list):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM schedule_lines WHERE file_url = ?", (file_url,))
@@ -164,57 +203,97 @@ async def save_schedule_to_db(file_url: str, file_title: str, lines: list):
             rows,
         )
         await db.commit()
-    logging.info(f"[БД] Сохранено {len(rows)} строк для файла '{file_title}'")
+    logging.info(f"[БД] Сохранено строк: {len(rows)}")
 
 
-async def find_group_schedule_text(group_name: str) -> str:
-    """Ищет расписание группы в БД с гибкой нормализацией и логами."""
+async def save_tables_to_db(file_url: str, file_title: str, tables: list):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM schedule_tables WHERE file_url = ?", (file_url,))
+        await db.execute(
+            "INSERT INTO schedule_tables (file_url, file_title, table_json) VALUES (?, ?, ?)",
+            (file_url, file_title, json.dumps(tables, ensure_ascii=False)),
+        )
+        await db.commit()
+    logging.info(f"[БД] Сохранено таблиц: {len(tables)}")
+
+
+# ============================================================
+# ПОИСК ГРУППЫ В ТАБЛИЦАХ
+# ============================================================
+def find_group_in_tables(tables: list, group_name: str) -> str:
+    """Ищет расписание группы в распарсенных таблицах."""
     target = normalize(group_name)
-    if not target:
-        return ""
+    logging.info(f"[ТАБЛИЦА] Ищем группу '{group_name}' (норм: '{target}')")
 
-    # Варианты для поиска: например для "ИТ-122" → ["ИТ122", "122", "ИТ"]
+    for table_idx, table in enumerate(tables):
+        if not table:
+            continue
+        logging.info(f"[ТАБЛИЦА] Таблица #{table_idx}, строк: {len(table)}")
+
+        for row_idx, row in enumerate(table):
+            group_cols = {}
+            for col_idx, cell in enumerate(row):
+                if not cell:
+                    continue
+                cell_norm = normalize(cell)
+                # Название группы: 2-4 буквы + 2-3 цифры, или с суффиксом /1
+                if re.fullmatch(r"[А-ЯЁA-Z]{2,4}\d{2,3}[\/\d]*", cell_norm):
+                    group_cols[col_idx] = cell_norm
+
+            if len(group_cols) >= 2:
+                logging.info(f"[ТАБЛИЦА] Строка заголовков (стр. {row_idx}): {group_cols}")
+
+                target_col = None
+                # Точное совпадение
+                for col_idx, gname in group_cols.items():
+                    if gname == target:
+                        target_col = col_idx
+                        break
+                # Если не нашли — по вхождению
+                if target_col is None:
+                    for col_idx, gname in group_cols.items():
+                        if target in gname or gname in target:
+                            target_col = col_idx
+                            break
+
+                if target_col is None:
+                    logging.info(f"[ТАБЛИЦА] В этой таблице группы {group_name} нет")
+                    continue
+
+                logging.info(f"[ТАБЛИЦА] ✅ Нашли столбец: {target_col}")
+
+                # Собираем данные только из этого столбца
+                result = []
+                for r in range(row_idx, len(table)):
+                    if target_col >= len(table[r]):
+                        continue
+                    cell = table[r][target_col]
+                    if cell:
+                        result.append(cell)
+
+                while result and not result[-1].strip():
+                    result.pop()
+
+                text = "\n".join(result).strip()
+                if text:
+                    return text
+
+    logging.warning(f"[ТАБЛИЦА] Группа '{group_name}' не найдена")
+    return ""
+
+
+# ============================================================
+# ПОИСК ГРУППЫ В СТРОКАХ (FALLBACK)
+# ============================================================
+async def _find_group_in_lines(group_name: str, files):
+    target = normalize(group_name)
     variants = [target]
     digits = re.findall(r"\d+", target)
     if digits:
         variants.append(digits[-1])
-    letters = re.findall(r"[А-ЯЁA-Z]+", target)
-    if letters:
-        variants.append(letters[0])
-
-    logging.info(f"[ПОИСК] Группа '{group_name}' → варианты: {variants}")
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT DISTINCT file_url, file_title FROM schedule_lines ORDER BY id DESC"
-        ) as cur:
-            files = await cur.fetchall()
-
-        logging.info(f"[ПОИСК] Всего файлов в БД: {len(files)}")
-        if not files:
-            logging.warning("[ПОИСК] В БД нет ни одной строки расписания!")
-            return ""
-
         for file_url, file_title in files:
-            logging.info(f"[ПОИСК] Проверяем файл: {file_title}")
-
-            async with db.execute(
-                "SELECT COUNT(*) FROM schedule_lines WHERE file_url = ?", (file_url,)
-            ) as cur:
-                cnt = (await cur.fetchone())[0]
-            logging.info(f"[ПОИСК]   строк в файле: {cnt}")
-
-            # Покажем первые 10 строк файла для отладки
-            async with db.execute(
-                "SELECT line_text FROM schedule_lines WHERE file_url = ? "
-                "ORDER BY line_no LIMIT 10",
-                (file_url,),
-            ) as cur:
-                sample = await cur.fetchall()
-            for s in sample:
-                logging.info(f"[ПОИСК]   sample: {s[0][:100]!r}")
-
-            hit = None
             for variant in variants:
                 async with db.execute(
                     "SELECT line_no, line_text FROM schedule_lines "
@@ -224,30 +303,57 @@ async def find_group_schedule_text(group_name: str) -> str:
                 ) as cur:
                     hit = await cur.fetchone()
                 if hit:
-                    logging.info(f"[ПОИСК]   ✅ Совпадение по '{variant}': {hit[1]!r}")
-                    break
-
-            if hit:
-                start_line = hit[0]
-                async with db.execute(
-                    "SELECT line_text FROM schedule_lines "
-                    "WHERE file_url = ? AND line_no >= ? "
-                    "ORDER BY line_no LIMIT 40",
-                    (file_url, start_line),
-                ) as cur:
-                    block = await cur.fetchall()
-
-                result_lines = []
-                for idx, (text,) in enumerate(block):
-                    result_lines.append(text)
-                    if idx > 0 and re.match(r"^\s*[А-ЯЁA-Z]{2,}[-\s]?\d", text.strip()) \
-                            and target not in normalize(text):
-                        result_lines.pop()
-                        break
-                return "\n".join(result_lines).strip()
-
-    logging.warning(f"[ПОИСК] Группа '{group_name}' не найдена ни в одном файле.")
+                    logging.info(f"[СТРОКИ] Совпадение по '{variant}'")
+                    start_line = hit[0]
+                    async with db.execute(
+                        "SELECT line_text FROM schedule_lines "
+                        "WHERE file_url = ? AND line_no >= ? "
+                        "ORDER BY line_no LIMIT 40",
+                        (file_url, start_line),
+                    ) as cur:
+                        block = await cur.fetchall()
+                    return "\n".join(r[0] for r in block).strip()
     return ""
+
+
+# ============================================================
+# ОБЩАЯ ФУНКЦИЯ ПОИСКА
+# ============================================================
+async def find_group_schedule_text(group_name: str) -> str:
+    """Ищет расписание группы: сначала по таблицам, потом fallback по строкам."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT DISTINCT file_url, file_title FROM schedule_lines ORDER BY id DESC"
+        ) as cur:
+            files = await cur.fetchall()
+
+    if not files:
+        logging.warning("[ПОИСК] В БД нет файлов")
+        return ""
+
+    # 1. Пробуем таблицы (в самом свежем файле)
+    file_url, file_title = files[0]
+    logging.info(f"[ПОИСК] Работаем с файлом: {file_title}")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT table_json FROM schedule_tables WHERE file_url = ? LIMIT 1",
+            (file_url,),
+        ) as cur:
+            row = await cur.fetchone()
+
+    if row and row[0]:
+        try:
+            tables = json.loads(row[0])
+            text = find_group_in_tables(tables, group_name)
+            if text:
+                return text
+        except Exception as e:
+            logging.error(f"Ошибка парсинга таблиц из БД: {e}")
+
+    # 2. Fallback по строкам
+    logging.info("[ПОИСК] Fallback на поиск по строкам")
+    return await _find_group_in_lines(group_name, files)
 
 
 # ============================================================
@@ -282,17 +388,13 @@ def text_to_pdf(text: str, title: str = "Расписание") -> bytes:
 # ПОЛУЧЕНИЕ ССЫЛОК С САЙТА
 # ============================================================
 async def fetch_pdf_links():
-    """
-    Возвращает список кортежей (url, title, date|None).
-    Оставляет ТОЛЬКО расписания занятий, отбрасывает звонки/пересдачи/задолженности.
-    """
     links = []
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         async with aiohttp.ClientSession() as session:
             async with session.get(SCHEDULE_URL, headers=headers) as resp:
                 if resp.status != 200:
-                    logging.error(f"[САЙТ] Статус {resp.status} при загрузке страницы")
+                    logging.error(f"[САЙТ] Статус {resp.status}")
                     return links
                 html = await resp.text()
 
@@ -302,25 +404,19 @@ async def fetch_pdf_links():
             text = a.get_text(strip=True)
             if not text:
                 continue
-
             low = text.lower()
 
-            # Исключаем нерелевантные ссылки
             if "звонк" in low:
                 continue
             if "задолженност" in low:
                 continue
             if "пересдач" in low:
                 continue
-
-            # Обязательно "занятий"
             if "занятий" not in low:
                 continue
-
             if ".pdf" not in href.lower() and "расписание" not in low:
                 continue
 
-            # Нормализуем URL
             if href.startswith("//"):
                 href = "https:" + href
             elif href.startswith("/"):
@@ -331,9 +427,9 @@ async def fetch_pdf_links():
             parsed_date = parse_date_from_title(text)
             links.append((href, text, parsed_date))
 
-        logging.info(f"[САЙТ] Найдено ссылок на расписание занятий: {len(links)}")
+        logging.info(f"[САЙТ] Найдено ссылок: {len(links)}")
         for url, title, d in links:
-            logging.info(f"[САЙТ]   {title} | дата: {d} | {url}")
+            logging.info(f"[САЙТ]   {title} | {d} | {url}")
     except Exception as e:
         logging.error(f"Ошибка получения ссылок: {e}")
     return links
@@ -350,8 +446,7 @@ async def download_pdf_content(session, url):
             if content.startswith(b"%PDF") or b"obj" in content[:100]:
                 return content
 
-            # Если это HTML-страница — ищем внутри ссылку на PDF
-            logging.info(f"[СКАЧ] {url} — не PDF, ищем внутри ссылку на PDF")
+            logging.info(f"[СКАЧ] {url} — не PDF, ищем внутри ссылку")
             soup = BeautifulSoup(content.decode("utf-8", errors="ignore"), "html.parser")
             for a in soup.find_all("a", href=True):
                 if ".pdf" in a["href"].lower():
@@ -367,7 +462,7 @@ async def download_pdf_content(session, url):
                         if pdf_resp.status == 200:
                             pdf_content = await pdf_resp.read()
                             if pdf_content.startswith(b"%PDF") or b"obj" in pdf_content[:100]:
-                                logging.info(f"[СКАЧ] Найден PDF внутри: {pdf_url}")
+                                logging.info(f"[СКАЧ] Найден PDF: {pdf_url}")
                                 return pdf_content
     except Exception as e:
         logging.error(f"Ошибка загрузки PDF {url}: {e}")
@@ -375,7 +470,7 @@ async def download_pdf_content(session, url):
 
 
 # ============================================================
-# ХЕНДЛЕРЫ КОМАНД
+# ХЕНДЛЕРЫ
 # ============================================================
 async def cmd_start(message: Message, state: FSMContext):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -453,7 +548,7 @@ async def process_date_request(message: Message, state: FSMContext):
         await status_msg.edit_text("❌ Не удалось найти расписание занятий на сайте.")
         return
 
-    # Разбираем ввод пользователя: "10", "10.10", "10.10.2026"
+    # Разбор даты от пользователя
     user_day = None
     user_month = None
     m = re.match(r"^(\d{1,2})(?:[.\-/](\d{1,2}))?", search_date)
@@ -462,7 +557,6 @@ async def process_date_request(message: Message, state: FSMContext):
         if m.group(2):
             user_month = int(m.group(2))
 
-    # Ищем ссылку с подходящей датой
     matched = None
     for url, title, d in links:
         if d is None:
@@ -471,7 +565,6 @@ async def process_date_request(message: Message, state: FSMContext):
             matched = (url, title, d)
             break
 
-    # Если не нашли — берём самое свежее расписание занятий
     if matched is None:
         dated = [(u, t, d) for (u, t, d) in links if d is not None]
         if dated:
@@ -480,10 +573,9 @@ async def process_date_request(message: Message, state: FSMContext):
             matched = links[0]
 
     pdf_link, link_title, _ = matched
-    logging.info(f"[ЗАПРОС] Пользователь {message.from_user.id}, группа {group_name}, "
-                 f"выбран файл: {link_title} | {pdf_link}")
+    logging.info(f"[ЗАПРОС] user={message.from_user.id} group={group_name} file={link_title}")
 
-    # Проверяем, есть ли уже строки этого файла в БД
+    # Проверка: есть ли уже в БД
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute(
             "SELECT 1 FROM schedule_lines WHERE file_url = ? LIMIT 1", (pdf_link,)
@@ -495,13 +587,16 @@ async def process_date_request(message: Message, state: FSMContext):
         async with aiohttp.ClientSession() as session:
             pdf_bytes = await download_pdf_content(session, pdf_link)
         if not pdf_bytes:
-            await status_msg.edit_text("❌ Не удалось скачать PDF-файл.")
+            await status_msg.edit_text("❌ Не удалось скачать PDF.")
             return
         lines = extract_pdf_lines(pdf_bytes)
-        if not lines:
-            await status_msg.edit_text("❌ PDF не содержит текста (возможно, это скан).")
+        tables = extract_pdf_tables(pdf_bytes)
+        if not lines and not tables:
+            await status_msg.edit_text("❌ PDF не содержит текста (возможно, скан).")
             return
         await save_schedule_to_db(pdf_link, link_title, lines)
+        if tables:
+            await save_tables_to_db(pdf_link, link_title, tables)
 
     schedule_text = await find_group_schedule_text(group_name)
     await status_msg.delete()
@@ -518,7 +613,6 @@ async def process_date_request(message: Message, state: FSMContext):
             parse_mode="Markdown",
         )
     else:
-        # Фолбэк — полный PDF без выделения группы
         if pdf_bytes is None:
             async with aiohttp.ClientSession() as session:
                 pdf_bytes = await download_pdf_content(session, pdf_link)
@@ -546,7 +640,6 @@ async def check_schedule(bot: Bot):
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with aiohttp.ClientSession() as session:
-            # Свежие сверху
             dated = [l for l in links if l[2] is not None]
             undated = [l for l in links if l[2] is None]
             dated.sort(key=lambda x: x[2], reverse=True)
@@ -564,10 +657,14 @@ async def check_schedule(bot: Bot):
                     continue
 
                 lines = extract_pdf_lines(pdf_bytes)
-                if not lines:
+                tables = extract_pdf_tables(pdf_bytes)
+                if not lines and not tables:
                     continue
 
                 await save_schedule_to_db(pdf_link, link_text, lines)
+                if tables:
+                    await save_tables_to_db(pdf_link, link_text, tables)
+
                 await db.execute(
                     "INSERT INTO sent_files (file_url) VALUES (?)", (pdf_link,)
                 )
@@ -614,7 +711,7 @@ async def check_schedule(bot: Bot):
 
 
 # ============================================================
-# ВЕБ-СЕРВЕР ДЛЯ HEALTH-CHECK
+# ВЕБ-СЕРВЕР
 # ============================================================
 async def handle(request):
     return web.Response(text="Бот запущен!")
