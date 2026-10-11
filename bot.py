@@ -66,6 +66,7 @@ async def cmd_change(message: Message, state: FSMContext):
     await state.set_state(RegisterState.waiting_for_group)
 
 async def process_group(message: Message, state: FSMContext):
+    # Очищаем название группы при сохранении
     group_name = message.text.strip().upper()
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -82,7 +83,9 @@ async def process_group(message: Message, state: FSMContext):
 
 def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
     try:
+        # Убираем дефисы, тире и пробелы для точного совпадения
         clean_target = group_name.replace("-", "").replace("–", "").replace(" ", "").upper()
+        
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
@@ -92,6 +95,7 @@ def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
                 for i, line in enumerate(lines):
                     clean_line = line.replace("-", "").replace("–", "").replace(" ", "").upper()
                     if clean_target in clean_line:
+                        # Захватываем строки под найденной группой
                         group_text_lines = lines[i:i+20]
                         return "\n".join(group_text_lines)
     except Exception as e:
@@ -101,8 +105,9 @@ def extract_group_schedule(pdf_bytes: bytes, group_name: str) -> str:
 async def fetch_pdf_links():
     links = []
     try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         async with aiohttp.ClientSession() as session:
-            async with session.get(SCHEDULE_URL) as resp:
+            async with session.get(SCHEDULE_URL, headers=headers) as resp:
                 if resp.status != 200:
                     return links
                 html = await resp.text()
@@ -111,24 +116,26 @@ async def fetch_pdf_links():
         for a in soup.find_all('a', href=True):
             href = a['href']
             text = a.get_text(strip=True)
-            if '.pdf' in href.lower() or 'расписание' in text.lower():
-                if href.startswith('/'):
-                    base_site = SCHEDULE_URL.split('/')[0] + '//' + SCHEDULE_URL.split('/')[2]
-                    href = base_site + href
+            if '.pdf' in href.lower() or 'расписание' in text.lower() or 'расписание' in href.lower():
+                if href.startswith('//'):
+                    href = 'https:' + href
+                elif href.startswith('/'):
+                    href = 'https://urgt66.ru' + href
                 elif not href.startswith('http'):
-                    href = SCHEDULE_URL.rsplit('/', 1)[0] + '/' + href
-                links.append((href, text))
+                    href = SCHEDULE_URL.rstrip('/') + '/' + href
+                links.append((href, text if text else "Расписание"))
     except Exception as e:
         logging.error(f"Ошибка получения ссылок: {e}")
     return links
 
 async def download_pdf_content(session, url):
     try:
-        async with session.get(url) as resp:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        async with session.get(url, headers=headers, allow_redirects=True) as resp:
             if resp.status != 200:
                 return None
             content = await resp.read()
-            if content.startswith(b'%PDF'):
+            if content.startswith(b'%PDF') or b'obj' in content[:100]:
                 return content
     except Exception as e:
         logging.error(f"Ошибка загрузки PDF {url}: {e}")
@@ -173,7 +180,7 @@ async def process_date_request(message: Message, state: FSMContext):
         pdf_bytes = await download_pdf_content(session, pdf_link)
 
     if not pdf_bytes:
-        await status_msg.edit_text("❌ Не удалось скачать PDF-файл (ссылка ведет не на документ).")
+        await status_msg.edit_text("❌ Не удалось скачать PDF-файл.")
         return
 
     schedule_text = extract_group_schedule(pdf_bytes, group_name)
