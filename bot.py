@@ -13,6 +13,7 @@ from PIL import Image
 
 PAGE_URL = os.environ.get("PAGE_URL", "https://urgt66.ru/partition/136056/")
 PREFS_FILE = os.environ.get("PREFS_FILE", "prefs.json")
+CHECK_EVERY = 1800  # проверка сайта раз в 30 минут (в секундах)
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -228,7 +229,8 @@ def parse_date(t: str):
 async def start(m: Message):
     user(m.from_user.id)["wait"] = "group"
     save_prefs()
-    await m.answer("Привет! Напиши номер своей группы, например: ИТ-121")
+    await m.answer("Привет! Напиши номер своей группы, например: ИТ-121\n\n"
+                   "Я буду сам присылать новое расписание, как только оно появится на сайте.")
 
 
 @router.callback_query(F.data.startswith("d:"))
@@ -269,6 +271,42 @@ async def text(m: Message):
     await send_schedule(m, m.from_user.id)
 
 
+# ---------- автоматическая проверка сайта ----------
+async def watcher(bot: Bot):
+    """Раз в 30 минут проверяет сайт и рассылает новые расписания."""
+    known = None
+    while True:
+        try:
+            _links["t"] = 0  # сбросить кэш, чтобы реально сходить на сайт
+            links = await get_links()
+            if known is None:
+                # первый запуск: запоминаем уже имеющиеся файлы, без рассылки
+                if links:
+                    known = set(links)
+            else:
+                for d in sorted(x for x in links if x not in known):
+                    pdf = await get_pdf(links[d])
+                    if not pdf:
+                        continue  # попробуем в следующий раз
+                    known.add(d)
+                    for uid, u in list(prefs.items()):
+                        if not u.get("group"):
+                            continue
+                        try:
+                            png = await asyncio.to_thread(crop_group, pdf, u["group"])
+                            if png:
+                                await bot.send_photo(
+                                    int(uid), BufferedInputFile(png, "schedule.png"),
+                                    caption=f"🆕 Новое расписание · {u['group']} · "
+                                            f"{d:%d.%m.%Y} ({DAYS[d.weekday()]})")
+                        except Exception as e:
+                            logging.warning("send to %s failed: %s", uid, e)
+                        await asyncio.sleep(0.1)
+        except Exception as e:
+            logging.warning("watcher error: %s", e)
+        await asyncio.sleep(CHECK_EVERY)
+
+
 # ---------- запуск ----------
 async def health(request):
     return web.Response(text="ok")
@@ -287,7 +325,11 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    watcher_task = asyncio.create_task(watcher(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        watcher_task.cancel()
 
 
 if __name__ == "__main__":
