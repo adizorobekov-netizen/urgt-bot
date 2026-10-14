@@ -4,6 +4,7 @@ from urllib.parse import urljoin
 
 import aiohttp
 import pdfplumber
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (BufferedInputFile, CallbackQuery,
@@ -24,7 +25,10 @@ except Exception:
 
 
 def save_prefs():
-    json.dump(prefs, open(PREFS_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    try:
+        json.dump(prefs, open(PREFS_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    except Exception as e:
+        logging.warning("save prefs failed: %s", e)
 
 
 def user(uid):
@@ -265,10 +269,24 @@ async def text(m: Message):
     await send_schedule(m, m.from_user.id)
 
 
+# ---------- запуск ----------
+async def health(request):
+    return web.Response(text="ok")
+
+
 async def main():
-    bot = Bot("8898464745:AAFxp2QqG_208csxd_qQI50OyXesJCaY05E")
+    # маленький веб-сервер, чтобы Render видел открытый порт
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+
+    bot = Bot(os.environ["BOT_TOKEN"])  # токен берётся из Render, не из кода
     dp = Dispatcher()
     dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 
