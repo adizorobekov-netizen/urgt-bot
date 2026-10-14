@@ -266,7 +266,7 @@ async def text(m: Message):
 
 
 async def main():
-    bot = Bot("8898464745:AAGsD4g7IkW2tO3hzPXWeB1yjjiR2DtWJnc")
+    bot = Bot("8898464745:AAFxp2QqG_208csxd_qQI50OyXesJCaY05E")
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
