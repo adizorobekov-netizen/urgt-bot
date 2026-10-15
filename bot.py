@@ -252,6 +252,8 @@ async def send_schedule(msg: Message, uid, d=None, full=False):
     if not full and u["group"]:
         png = await cache_png(entry, u["group"])   # готовая картинка, без повторной обрезки
         if png:
+            _mark_sent(u, d, png)
+            save_prefs()
             return await msg.answer_photo(
                 BufferedInputFile(png, "schedule.png"),
                 caption=f"Группа {u['group']} · {d:%d.%m.%Y} ({DAYS[d.weekday()]})",
@@ -320,18 +322,36 @@ async def text(m: Message):
 
 
 # ---------- автопроверка сайта и рассылка ----------
-async def notify(bot: Bot, d: date, entry: dict):
+def _same_sent(u: dict, d: date, png: bytes) -> bool:
+    """True, если именно эта картинка уже отправлялась пользователю (дубли не шлём)."""
+    sent = u.setdefault("sent", {})
+    return sent.get(d.isoformat()) == hashlib.sha1(png).hexdigest()
+
+
+def _mark_sent(u: dict, d: date, png: bytes):
+    sent = u.setdefault("sent", {})
+    sent[d.isoformat()] = hashlib.sha1(png).hexdigest()
+    for k in sorted(sent)[:-10]:      # храним только последние 10 дней
+        del sent[k]
+
+
+async def notify(bot: Bot, d: date, entry: dict, only_mark=False):
+    """Шлёт расписание, только если картинка группы реально изменилась."""
     for uid, u in list(prefs.items()):
         if not u.get("group"):
             continue
         try:
             png = await cache_png(entry, u["group"])
-            if png:
+            if not png or _same_sent(u, d, png):
+                continue
+            if not only_mark:
                 await bot.send_photo(int(uid), BufferedInputFile(png, "schedule.png"),
                                      caption=f"🆕 Новое расписание · {u['group']} · {d:%d.%m.%Y} ({DAYS[d.weekday()]})")
+                await asyncio.sleep(0.1)
+            _mark_sent(u, d, png)
         except Exception as e:
             logging.warning("send to %s failed: %s", uid, e)
-        await asyncio.sleep(0.1)
+    save_prefs()
 
 
 async def watcher(bot: Bot):
@@ -350,8 +370,8 @@ async def watcher(bot: Bot):
                     continue
                 if seen.get(url) != entry["sha"]:
                     seen[url] = entry["sha"]
-                    if not first:
-                        await notify(bot, d, entry)
+                    # при первом запуске только запоминаем, что уже есть (без рассылки)
+                    await notify(bot, d, entry, only_mark=first)
             if links:
                 first = False
         except Exception as e:
@@ -395,7 +415,7 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
 
-    bot = Bot(os.environ["BOT_TOKEN"])  # токен берётся из Render, не из кода
+    bot = Bot(os.environ["BOT_TOKEN"])  # токен берётся из переменной окружения, не из кода
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
