@@ -1,9 +1,10 @@
-import asyncio, io, json, logging, os, re, time
-from datetime import date
+import asyncio, hashlib, io, json, logging, os, re, shutil, time
+from datetime import date, timedelta
 from urllib.parse import urljoin
 
 import aiohttp
 import pdfplumber
+import pypdfium2 as pdfium
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
@@ -13,7 +14,9 @@ from PIL import Image
 
 PAGE_URL = os.environ.get("PAGE_URL", "https://urgt66.ru/partition/136056/")
 PREFS_FILE = os.environ.get("PREFS_FILE", "prefs.json")
-CHECK_EVERY = 1800  # проверка сайта раз в 30 минут (в секундах)
+CACHE_DIR = os.environ.get("CACHE_DIR", "cache")   # сюда сохраняются вырезанные картинки
+CACHE_TTL = 24 * 3600                              # через сутки картинки удаляются и создаются заново
+CHECK_EVERY = 1800                                 # проверка сайта раз в 30 минут
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -37,7 +40,7 @@ def user(uid):
 
 
 # ---------- названия групп ----------
-LAT, CYR = "ABCEHKMOPTXY", "АВСЕНКМОРТХУ"
+LAT, CYR = "ABCEHKMOPTXYI", "АВСЕНКМОРТХУИ"
 TR = str.maketrans(LAT, CYR)
 
 
@@ -54,11 +57,14 @@ def decode_group(prefix: str, digits: str) -> str:
     return (p or "П") + digits
 
 
-# ---------- вырезание колонки группы ----------
-def _render(page, bbox, res):
+# ---------- вырезание колонок ----------
+def _render(pg, bbox, res):
+    """Рисует только нужный кусок страницы (экономит память)."""
+    W, H = pg.get_size()
     x0, t, x1, b = bbox
-    bbox = (max(0, x0), max(0, t), min(page.width, x1), min(page.height, b))
-    return page.crop(bbox).to_image(resolution=res).original.convert("RGB")
+    x0, t, x1, b = max(0, x0), max(0, t), min(W, x1), min(H, b)
+    bm = pg.render(scale=res / 72, crop=(x0, H - b, W - x1, t))
+    return bm.to_pil().convert("RGB")
 
 
 def find_headers(page):
@@ -80,37 +86,70 @@ def find_headers(page):
     return [sorted(r, key=lambda w: w["x0"]) for r in rows if len(r) >= 3]
 
 
-def crop_group(pdf_bytes: bytes, group: str):
-    target = norm(group)
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for page in pdf.pages:
-            rows = find_headers(page)
-            words = page.extract_words()
-            if not words:
-                continue
-            table_left = min(w["x0"] for w in words) - 3
-            page_bottom = max(w["bottom"] for w in words) + 4
-            for ri, row in enumerate(rows):
-                for ci, w in enumerate(row):
-                    if w["g"] != target:
-                        continue
+def _build_sync(sha: str, pdf_bytes: bytes):
+    """Вырезает ВСЕ группы из PDF один раз и сохраняет в cache/<sha>/ГРУППА.png"""
+    final = os.path.join(CACHE_DIR, sha)
+    tmp = final + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    doc = pdfium.PdfDocument(pdf_bytes)
+    count = 0
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for pi, page in enumerate(pdf.pages):
+                rows = find_headers(page)
+                words = page.extract_words()
+                if not words:
+                    continue
+                table_left = min(w["x0"] for w in words) - 3
+                page_bottom = max(w["bottom"] for w in words) + 4
+                pg = doc[pi]
+                for ri, row in enumerate(rows):
                     cx = [(r["x0"] + r["x1"]) / 2 for r in row]
                     pitch = (cx[-1] - cx[0]) / (len(cx) - 1) if len(cx) > 1 else 40
-                    left = (cx[ci - 1] + cx[ci]) / 2 if ci > 0 else cx[ci] - pitch / 2
-                    right = (cx[ci] + cx[ci + 1]) / 2 if ci + 1 < len(cx) else cx[ci] + pitch / 2
                     first_left = cx[0] - pitch / 2
-                    top = w["top"] - 3
-                    bottom = rows[ri + 1][0]["top"] - 3 if ri + 1 < len(rows) else page_bottom
-                    h = max(w["bottom"] - w["top"], 3)
-                    res = int(min(600, max(250, 2000 / h)))
-                    i1 = _render(page, (table_left, top, first_left, bottom), res)
-                    i2 = _render(page, (left, top, right, bottom), res)
-                    out = Image.new("RGB", (i1.width + i2.width, max(i1.height, i2.height)), "white")
-                    out.paste(i1, (0, 0))
-                    out.paste(i2, (i1.width, 0))
-                    buf = io.BytesIO()
-                    out.save(buf, "PNG", optimize=True)
-                    return buf.getvalue()
+                    for ci, w in enumerate(row):
+                        path = os.path.join(tmp, w["g"] + ".png")
+                        if os.path.exists(path):
+                            continue
+                        left = (cx[ci - 1] + cx[ci]) / 2 if ci > 0 else cx[ci] - pitch / 2
+                        right = (cx[ci] + cx[ci + 1]) / 2 if ci + 1 < len(cx) else cx[ci] + pitch / 2
+                        top = w["top"] - 3
+                        bottom = rows[ri + 1][0]["top"] - 3 if ri + 1 < len(rows) else page_bottom
+                        h = max(w["bottom"] - w["top"], 3)
+                        res = int(min(450, max(250, 2000 / h)))
+                        i1 = _render(pg, (table_left, top, first_left, bottom), res)
+                        i2 = _render(pg, (left, top, right, bottom), res)
+                        out = Image.new("RGB", (i1.width + i2.width, max(i1.height, i2.height)), "white")
+                        out.paste(i1, (0, 0))
+                        out.paste(i2, (i1.width, 0))
+                        out.save(path, "PNG", optimize=True)
+                        count += 1
+    finally:
+        doc.close()
+    open(os.path.join(tmp, ".ok"), "w").write(str(time.time()))
+    shutil.rmtree(final, ignore_errors=True)
+    os.replace(tmp, final)
+    logging.info("cache built: %s, groups: %d", sha[:8], count)
+
+
+_build_lock = asyncio.Lock()
+
+
+async def build_cache(sha: str, data: bytes):
+    async with _build_lock:
+        if os.path.exists(os.path.join(CACHE_DIR, sha, ".ok")):
+            return
+        await asyncio.to_thread(_build_sync, sha, data)
+
+
+async def cache_png(entry: dict, group: str):
+    """Готовая картинка группы из кэша (если кэша нет - создаст его один раз)."""
+    path = os.path.join(CACHE_DIR, entry["sha"], norm(group) + ".png")
+    if not os.path.exists(os.path.join(CACHE_DIR, entry["sha"], ".ok")):
+        await build_cache(entry["sha"], entry["data"])
+    if os.path.exists(path):
+        return open(path, "rb").read()
     return None
 
 
@@ -122,7 +161,7 @@ LINK_RE = re.compile(r'href="([^"]*raspisanie-zanyatij-na-(\d{1,2})-([a-z]+)-(\d
 DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 _links = {"t": 0, "d": {}}
-_pdfs = {}
+_pdfs = {}  # url -> {"data": bytes, "sha": str, "t": время скачивания}
 
 
 async def get_links() -> dict:
@@ -144,21 +183,30 @@ async def get_links() -> dict:
     return _links["d"]
 
 
-async def get_pdf(url: str):
-    if url in _pdfs:
-        return _pdfs[url]
+async def ensure(url: str, max_age=None):
+    """Скачивает PDF и (один раз!) вырезает из него все группы."""
+    cur = _pdfs.get(url)
+    if cur and (max_age is None or time.time() - cur["t"] < max_age):
+        return cur
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=60)) as r:
                 data = await r.read()
-        if data[:4] == b"%PDF":
-            if len(_pdfs) > 10:
-                _pdfs.clear()
-            _pdfs[url] = data
-            return data
+        if data[:4] != b"%PDF":
+            return cur
     except Exception as e:
         logging.warning("pdf download failed: %s", e)
-    return None
+        return cur
+    sha = hashlib.sha1(data).hexdigest()
+    if cur and cur["sha"] == sha:
+        cur["t"] = time.time()
+        return cur
+    entry = {"data": data, "sha": sha, "t": time.time()}
+    await build_cache(sha, data)
+    _pdfs[url] = entry
+    if len(_pdfs) > 12:
+        _pdfs.pop(min(_pdfs, key=lambda k: _pdfs[k]["t"]))
+    return entry
 
 
 def fmt(d: date) -> str:
@@ -198,18 +246,18 @@ async def send_schedule(msg: Message, uid, d=None, full=False):
                                 reply_markup=kb(links))
     u["date"] = d.isoformat()
     save_prefs()
-    pdf = await get_pdf(links[d])
-    if not pdf:
+    entry = await ensure(links[d])
+    if not entry:
         return await msg.answer("Не удалось скачать PDF. Попробуй позже.", reply_markup=kb(links))
     if not full and u["group"]:
-        png = await asyncio.to_thread(crop_group, pdf, u["group"])
+        png = await cache_png(entry, u["group"])   # готовая картинка, без повторной обрезки
         if png:
             return await msg.answer_photo(
                 BufferedInputFile(png, "schedule.png"),
                 caption=f"Группа {u['group']} · {d:%d.%m.%Y} ({DAYS[d.weekday()]})",
                 reply_markup=kb(links))
         await msg.answer(f"Группу «{u['group']}» на {d:%d.%m} не нашёл. Отправляю полное расписание.")
-    await msg.answer_document(BufferedInputFile(pdf, f"Расписание_{d:%d.%m.%Y}.pdf"),
+    await msg.answer_document(BufferedInputFile(entry["data"], f"Расписание_{d:%d.%m.%Y}.pdf"),
                               reply_markup=kb(links))
 
 
@@ -271,40 +319,65 @@ async def text(m: Message):
     await send_schedule(m, m.from_user.id)
 
 
-# ---------- автоматическая проверка сайта ----------
+# ---------- автопроверка сайта и рассылка ----------
+async def notify(bot: Bot, d: date, entry: dict):
+    for uid, u in list(prefs.items()):
+        if not u.get("group"):
+            continue
+        try:
+            png = await cache_png(entry, u["group"])
+            if png:
+                await bot.send_photo(int(uid), BufferedInputFile(png, "schedule.png"),
+                                     caption=f"🆕 Новое расписание · {u['group']} · {d:%d.%m.%Y} ({DAYS[d.weekday()]})")
+        except Exception as e:
+            logging.warning("send to %s failed: %s", uid, e)
+        await asyncio.sleep(0.1)
+
+
 async def watcher(bot: Bot):
-    """Раз в 30 минут проверяет сайт и рассылает новые расписания."""
-    known = None
+    """Раз в 30 минут проверяет сайт; новый или изменённый файл режет один раз и рассылает."""
+    seen = {}
+    first = True
     while True:
         try:
-            _links["t"] = 0  # сбросить кэш, чтобы реально сходить на сайт
+            _links["t"] = 0
             links = await get_links()
-            if known is None:
-                # первый запуск: запоминаем уже имеющиеся файлы, без рассылки
-                if links:
-                    known = set(links)
-            else:
-                for d in sorted(x for x in links if x not in known):
-                    pdf = await get_pdf(links[d])
-                    if not pdf:
-                        continue  # попробуем в следующий раз
-                    known.add(d)
-                    for uid, u in list(prefs.items()):
-                        if not u.get("group"):
-                            continue
-                        try:
-                            png = await asyncio.to_thread(crop_group, pdf, u["group"])
-                            if png:
-                                await bot.send_photo(
-                                    int(uid), BufferedInputFile(png, "schedule.png"),
-                                    caption=f"🆕 Новое расписание · {u['group']} · "
-                                            f"{d:%d.%m.%Y} ({DAYS[d.weekday()]})")
-                        except Exception as e:
-                            logging.warning("send to %s failed: %s", uid, e)
-                        await asyncio.sleep(0.1)
+            for d, url in sorted(links.items()):
+                if d < date.today() - timedelta(days=1):
+                    continue
+                entry = await ensure(url, max_age=0)
+                if not entry:
+                    continue
+                if seen.get(url) != entry["sha"]:
+                    seen[url] = entry["sha"]
+                    if not first:
+                        await notify(bot, d, entry)
+            if links:
+                first = False
         except Exception as e:
             logging.warning("watcher error: %s", e)
         await asyncio.sleep(CHECK_EVERY)
+
+
+# ---------- очистка кэша раз в сутки ----------
+async def cleanup_loop():
+    """Раз в час удаляет картинки старше суток (и ненужные) и сразу создаёт свежие."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            now = time.time()
+            actual = {e["sha"] for e in _pdfs.values()}
+            for name in os.listdir(CACHE_DIR):
+                d = os.path.join(CACHE_DIR, name)
+                marker = os.path.join(d, ".ok")
+                age = now - (os.path.getmtime(marker) if os.path.exists(marker) else os.path.getmtime(d))
+                if age > CACHE_TTL or (name not in actual and not name.endswith(".tmp")):
+                    shutil.rmtree(d, ignore_errors=True)
+                    logging.info("cache removed: %s", name[:8])
+            for e in list(_pdfs.values()):
+                await build_cache(e["sha"], e["data"])   # свежие вместо удалённых
+        except Exception as e:
+            logging.warning("cleanup error: %s", e)
 
 
 # ---------- запуск ----------
@@ -313,23 +386,25 @@ async def health(request):
 
 
 async def main():
-    # маленький веб-сервер, чтобы Render видел открытый порт
+    shutil.rmtree(CACHE_DIR, ignore_errors=True)   # после перезапуска начинаем с чистого кэша
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
     app = web.Application()
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
+    await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
 
     bot = Bot(os.environ["BOT_TOKEN"])  # токен берётся из Render, не из кода
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    watcher_task = asyncio.create_task(watcher(bot))
+    tasks = [asyncio.create_task(watcher(bot)), asyncio.create_task(cleanup_loop())]
     try:
         await dp.start_polling(bot)
     finally:
-        watcher_task.cancel()
+        for t in tasks:
+            t.cancel()
 
 
 if __name__ == "__main__":
