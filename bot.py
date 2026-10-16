@@ -116,6 +116,12 @@ def _build_sync(sha: str, pdf_bytes: bytes):
                         right = (cx[ci] + cx[ci + 1]) / 2 if ci + 1 < len(cx) else cx[ci] + pitch / 2
                         top = w["top"] - 3
                         bottom = rows[ri + 1][0]["top"] - 3 if ri + 1 < len(rows) else page_bottom
+                        # подпись = текст уроков группы (не зависит от сдвигов сетки и служебных данных файла)
+                        cell = [x for x in words if x["x0"] >= left - 1 and x["x1"] <= right + 1
+                                and x["top"] >= top - 1 and x["bottom"] <= bottom + 1]
+                        cell.sort(key=lambda x: (round(x["top"]), x["x0"]))
+                        sig = hashlib.sha1(" ".join(x["text"] for x in cell).encode()).hexdigest()
+                        open(os.path.join(tmp, w["g"] + ".sig"), "w").write(sig)
                         h = max(w["bottom"] - w["top"], 3)
                         res = int(min(450, max(250, 2000 / h)))
                         i1 = _render(pg, (table_left, top, first_left, bottom), res)
@@ -151,6 +157,14 @@ async def cache_png(entry: dict, group: str):
     if os.path.exists(path):
         return open(path, "rb").read()
     return None
+
+
+async def cache_sig(entry: dict, group: str):
+    """Подпись расписания группы (хэш текста). Одинаковая подпись = расписание не менялось."""
+    path = os.path.join(CACHE_DIR, entry["sha"], norm(group) + ".sig")
+    if not os.path.exists(os.path.join(CACHE_DIR, entry["sha"], ".ok")):
+        await build_cache(entry["sha"], entry["data"])
+    return open(path).read() if os.path.exists(path) else None
 
 
 # ---------- сайт ----------
@@ -252,7 +266,7 @@ async def send_schedule(msg: Message, uid, d=None, full=False):
     if not full and u["group"]:
         png = await cache_png(entry, u["group"])   # готовая картинка, без повторной обрезки
         if png:
-            _mark_sent(u, d, png)
+            _mark_sent(u, d, await cache_sig(entry, u["group"]) or hashlib.sha1(png).hexdigest())
             save_prefs()
             return await msg.answer_photo(
                 BufferedInputFile(png, "schedule.png"),
@@ -322,33 +336,35 @@ async def text(m: Message):
 
 
 # ---------- автопроверка сайта и рассылка ----------
-def _same_sent(u: dict, d: date, png: bytes) -> bool:
-    """True, если именно эта картинка уже отправлялась пользователю (дубли не шлём)."""
-    sent = u.setdefault("sent", {})
-    return sent.get(d.isoformat()) == hashlib.sha1(png).hexdigest()
+def _same_sent(u: dict, d: date, sig: str) -> bool:
+    """True, если это же расписание уже отправлялось пользователю (дубли не шлём)."""
+    return u.setdefault("sent", {}).get(d.isoformat()) == sig
 
 
-def _mark_sent(u: dict, d: date, png: bytes):
+def _mark_sent(u: dict, d: date, sig: str):
     sent = u.setdefault("sent", {})
-    sent[d.isoformat()] = hashlib.sha1(png).hexdigest()
+    sent[d.isoformat()] = sig
     for k in sorted(sent)[:-10]:      # храним только последние 10 дней
         del sent[k]
 
 
 async def notify(bot: Bot, d: date, entry: dict, only_mark=False):
-    """Шлёт расписание, только если картинка группы реально изменилась."""
+    """Шлёт расписание, только если расписание группы реально изменилось."""
     for uid, u in list(prefs.items()):
         if not u.get("group"):
             continue
         try:
             png = await cache_png(entry, u["group"])
-            if not png or _same_sent(u, d, png):
+            if not png:
+                continue
+            sig = await cache_sig(entry, u["group"]) or hashlib.sha1(png).hexdigest()
+            if _same_sent(u, d, sig):
                 continue
             if not only_mark:
                 await bot.send_photo(int(uid), BufferedInputFile(png, "schedule.png"),
                                      caption=f"🆕 Новое расписание · {u['group']} · {d:%d.%m.%Y} ({DAYS[d.weekday()]})")
                 await asyncio.sleep(0.1)
-            _mark_sent(u, d, png)
+            _mark_sent(u, d, sig)
         except Exception as e:
             logging.warning("send to %s failed: %s", uid, e)
     save_prefs()
