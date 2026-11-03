@@ -1285,6 +1285,53 @@ async def main():
         for t in tasks:
             t.cancel()
 
+# ---------- рассылка всем пользователям ----------
 
+@router.message(F.text.startswith("/broadcast"))
+async def broadcast(m: Message, bot: Bot):
+    if m.from_user.id != ADMIN_ID:
+        return await m.answer("⛔ У тебя нет доступа к этой команде.")
+
+    text_to_send = m.text.partition(" ")[2].strip()
+
+    if not text_to_send:
+        return await m.answer(
+            "Использование:\n"
+            "/broadcast Текст сообщения\n\n"
+            "Например:\n"
+            "/broadcast Привет! Это сообщение от администратора."
+        )
+
+    users = list(prefs.keys())
+    sent = 0
+    failed = 0
+
+    status = await m.answer(
+        f"📨 Начинаю рассылку для {len(users)} пользователей..."
+    )
+
+    for uid in users:
+        try:
+            await bot.send_message(
+                chat_id=int(uid),
+                text=text_to_send
+            )
+            sent += 1
+
+        except Exception as e:
+            failed += 1
+            logging.warning(
+                "Broadcast failed for %s: %s",
+                uid,
+                e
+            )
+
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(
+        "✅ Рассылка завершена!\n\n"
+        f"📬 Отправлено: {sent}\n"
+        f"❌ Не доставлено: {failed}"
+    )
 if __name__ == "__main__":
     asyncio.run(main())
