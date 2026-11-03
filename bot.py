@@ -1219,13 +1219,17 @@ async def health(request):
     return web.Response(text="ok")
 
 # --- РАССЫЛКА ВСЕМ ПОЛЬЗОВАТЕЛЯМ ---
-@router.message(F.text)
+@router.message(F.text.startswith('/broadcast'))
 async def send_to_all_users(message: Message):
     # Проверяем, что пишет админ
     if message.from_user.id != ADMIN_ID:
         return
-    # Пропускаем команды (начинающиеся с /)
-    if message.text.startswith('/'):
+            # Берем текст после команды /broadcast
+    text_to_send = message.text.replace('/broadcast', '').strip()
+    
+    # Если после команды нет текста, останавливаемся
+    if not text_to_send:
+        await message.answer("Напиши так: /broadcast Твой текст")
         return
 
     status_msg = await message.answer("⏳ Начинаю рассылку...")
@@ -1244,7 +1248,7 @@ async def send_to_all_users(message: Message):
         if str(user_id) == str(ADMIN_ID):
             continue
         try:
-            await message.copy_to(chat_id=int(user_id))
+            await message.bot.send_message(chat_id=int(user_id), text=text_to_send)
             success += 1
             await asyncio.sleep(0.05) 
         except Exception as e:
