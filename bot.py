@@ -32,7 +32,7 @@ PAGE_URL = os.environ.get(
     "PAGE_URL",
     "https://urgt66.ru/partition/136056/"
 )
-
+ADMIN_ID = int(os.environ["7950161245"])
 PREFS_FILE = os.environ.get("PREFS_FILE", "prefs.json")
 CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
 
