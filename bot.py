@@ -1218,6 +1218,42 @@ async def cleanup_loop():
 async def health(request):
     return web.Response(text="ok")
 
+# --- РАССЫЛКА ВСЕМ ПОЛЬЗОВАТЕЛЯМ ---
+@router.message(F.text)
+async def send_to_all_users(message: Message):
+    # Проверяем, что пишет админ
+    if message.from_user.id != ADMIN_ID:
+        return
+    # Пропускаем команды (начинающиеся с /)
+    if message.text.startswith('/'):
+        return
+
+    status_msg = await message.answer("⏳ Начинаю рассылку...")
+    
+    try:
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            users_data = json.load(f)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Ошибка чтения базы: {e}")
+        return
+
+    success = 0
+    failed = 0
+
+    for user_id in users_data.keys():
+        if str(user_id) == str(ADMIN_ID):
+            continue
+        try:
+            await message.copy_to(chat_id=int(user_id))
+            success += 1
+            await asyncio.sleep(0.05) 
+        except Exception as e:
+            failed += 1
+            logging.error(f"Не доставлено {user_id}: {e}")
+
+    await status_msg.edit_text(f"✅ Готово!\nДоставлено: {success}\nНе доставлено: {failed}")
+# -----------------------------------
+
 
 async def main():
     shutil.rmtree(
