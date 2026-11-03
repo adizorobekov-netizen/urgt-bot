@@ -6,7 +6,7 @@ import aiohttp
 import pdfplumber
 import pypdfium2 as pdfium
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart
 from aiogram.types import (BufferedInputFile, CallbackQuery,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
@@ -17,6 +17,10 @@ PREFS_FILE = os.environ.get("PREFS_FILE", "prefs.json")
 CACHE_DIR = os.environ.get("CACHE_DIR", "cache")   # сюда сохраняются вырезанные картинки
 CACHE_TTL = 24 * 3600                              # через сутки картинки удаляются и создаются заново
 CHECK_EVERY = 1800                                 # проверка сайта раз в 30 минут
+CHANNEL = os.environ.get("@kirafear", "").strip()    # канал для обязательной подписки: @имя_канала или -100...
+CHANNEL_URL = os.environ.get("https://t.me/kirafear", "").strip()  # ссылка на канал (для кнопки)
+if not CHANNEL_URL and CHANNEL.startswith("@"):
+    CHANNEL_URL = "https://t.me/" + CHANNEL[1:]
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -37,6 +41,62 @@ def save_prefs():
 
 def user(uid):
     return prefs.setdefault(str(uid), {"group": None, "date": None, "wait": None})
+
+
+# ---------- обязательная подписка на канал ----------
+GATE_TEXT = ("📢 Чтобы пользоваться ботом, подпишись на наш канал.\n\n"
+             "После подписки нажми «✅ Я подписался».")
+GATE_TEXT_OLD = ("📢 Теперь для работы бота нужна подписка на наш канал.\n\n"
+                 "Подпишись и нажми «✅ Я подписался» - расписание снова будет приходить.")
+_sub_cache = {}  # uid -> (время проверки, подписан ли)
+
+
+def gate_kb():
+    rows = []
+    if CHANNEL_URL:
+        rows.append([InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)])
+    rows.append([InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def is_subscribed(bot: Bot, uid: int, fresh=False) -> bool:
+    """Подписан ли пользователь на канал. Если CHANNEL не задан - проверка выключена."""
+    if not CHANNEL:
+        return True
+    c = _sub_cache.get(uid)
+    if c and not fresh and time.time() - c[0] < (300 if c[1] else 15):
+        return c[1]
+    try:
+        m = await bot.get_chat_member(CHANNEL, uid)
+        ok = m.status in ("creator", "administrator", "member") or \
+            (m.status == "restricted" and getattr(m, "is_member", False))
+    except Exception as e:
+        # чаще всего бот не добавлен в канал администратором - тогда не блокируем всех
+        logging.warning("subscription check failed (бот - админ канала?): %s", e)
+        return True
+    _sub_cache[uid] = (time.time(), ok)
+    return ok
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    """Без подписки на канал бот ничего не делает, только просит подписаться."""
+
+    async def __call__(self, handler, event, data):
+        u = getattr(event, "from_user", None)
+        if not CHANNEL or u is None:
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and event.data == "check_sub":
+            return await handler(event, data)
+        if await is_subscribed(data["bot"], u.id):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            await event.answer("Сначала подпишись на канал", show_alert=True)
+            return await event.message.answer(GATE_TEXT, reply_markup=gate_kb())
+        return await event.answer(GATE_TEXT, reply_markup=gate_kb())
+
+
+router.message.outer_middleware(SubscriptionMiddleware())
+router.callback_query.outer_middleware(SubscriptionMiddleware())
 
 
 # ---------- названия групп ----------
@@ -322,6 +382,22 @@ async def cb_full(c: CallbackQuery):
     await send_schedule(c.message, c.from_user.id, d, full=True)
 
 
+@router.callback_query(F.data == "check_sub")
+async def cb_check_sub(c: CallbackQuery):
+    if await is_subscribed(c.bot, c.from_user.id, fresh=True):
+        await c.answer("Подписка подтверждена ✅")
+        try:
+            await c.message.edit_text("✅ Подписка подтверждена!")
+        except Exception:
+            pass
+        if user(c.from_user.id)["group"]:
+            await send_schedule(c.message, c.from_user.id)
+        else:
+            await c.message.answer("Напиши номер своей группы, например: ИТ-121")
+    else:
+        await c.answer("Подписка не найдена. Подпишись на канал и нажми кнопку ещё раз.", show_alert=True)
+
+
 @router.message(F.text)
 async def text(m: Message):
     u = user(m.from_user.id)
@@ -354,6 +430,8 @@ async def notify(bot: Bot, d: date, entry: dict, only_mark=False):
         if not u.get("group"):
             continue
         try:
+            if not await is_subscribed(bot, int(uid)):
+                continue          # без подписки на канал расписание не присылаем
             png = await cache_png(entry, u["group"])
             if not png:
                 continue
@@ -393,6 +471,24 @@ async def watcher(bot: Bot):
         except Exception as e:
             logging.warning("watcher error: %s", e)
         await asyncio.sleep(CHECK_EVERY)
+
+
+async def announce_old_users(bot: Bot):
+    """Один раз напоминает старым пользователям (кто ещё не подписан) про канал."""
+    if not CHANNEL:
+        return
+    await asyncio.sleep(10)
+    for uid, u in list(prefs.items()):
+        if u.get("op_notified"):
+            continue
+        try:
+            if not await is_subscribed(bot, int(uid), fresh=True):
+                await bot.send_message(int(uid), GATE_TEXT_OLD, reply_markup=gate_kb())
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            logging.warning("announce to %s failed: %s", uid, e)
+        u["op_notified"] = True      # больше этому пользователю не напоминаем
+    save_prefs()
 
 
 # ---------- очистка кэша раз в сутки ----------
@@ -435,7 +531,8 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)
-    tasks = [asyncio.create_task(watcher(bot)), asyncio.create_task(cleanup_loop())]
+    tasks = [asyncio.create_task(watcher(bot)), asyncio.create_task(cleanup_loop()),
+             asyncio.create_task(announce_old_users(bot))]
     try:
         await dp.start_polling(bot)
     finally:
