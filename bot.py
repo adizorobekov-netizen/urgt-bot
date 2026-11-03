@@ -17,10 +17,10 @@ PREFS_FILE = os.environ.get("PREFS_FILE", "prefs.json")
 CACHE_DIR = os.environ.get("CACHE_DIR", "cache")   # сюда сохраняются вырезанные картинки
 CACHE_TTL = 24 * 3600                              # через сутки картинки удаляются и создаются заново
 CHECK_EVERY = 1800                                 # проверка сайта раз в 30 минут
-CHANNEL = os.environ.get("@kirafear", "").strip()    # канал для обязательной подписки: @имя_канала или -100...
-CHANNEL_URL = os.environ.get("https://t.me/kirafear", "").strip()  # ссылка на канал (для кнопки)
-if not CHANNEL_URL and CHANNEL.startswith("@"):
-    CHANNEL_URL = "https://t.me/" + CHANNEL[1:]
+CHANNEL = os.environ.get("CHANNEL", "").strip()    # канал для обязательной подписки: @имя_канала или -100...
+CHANNEL_URL = os.environ.get("CHANNEL_URL", "").strip()  # ссылка на канал (для кнопки)
+if not CHANNEL_URL and CHANNEL.startswith("@kirafear"):
+    CHANNEL_URL = "https://t.me/kirafear" + CHANNEL[1:]
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
